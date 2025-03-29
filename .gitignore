@@ -1,0 +1,36 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Configuration and sensitive data
+.env
+*.db
+*.db-journal
+*.sqlite
+*.sqlite3
+
+# Log files
+logs/
+*.log
+
+# Data directories
+data/json_logs/
+data/captured/
+
+# IDE-specific files
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# macOS files
+.DS_Store
