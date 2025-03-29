@@ -12,6 +12,7 @@ from datetime import datetime, timedelta
 from typing import Dict, List, Any, Optional
 
 import aiohttp
+from pymongo.errors import PyMongoError
 
 from src.telegram.client import TelegramMonitor
 from src.processing.worker_pool import WorkerPool
@@ -183,22 +184,18 @@ class Coordinator:
         logger.info(f"Attempting to register webhooks with base URL: {base_webhook_url}")
         
         active_tokens = [] # Default to empty list
-        # We need a way to get active tokens. Placeholder for now.
-        # Assume telegram_monitor can provide this, or fetch from DB.
-        # --- SECTION TO BE RE-ENABLED WHEN get_active_bot_tokens IS IMPLEMENTED --- 
-        # try:
-        #     # TODO: Implement get_active_bot_tokens in TelegramMonitor or fetch differently
-        #     active_tokens = await self.telegram_monitor.get_active_bot_tokens() 
-        #     if not active_tokens:
-        #         logger.warning("No active bot tokens found to register webhooks for.")
-        #         # return # Decide if we should proceed without tokens
-        # except AttributeError:
-        #      logger.error("Coordinator cannot get active bot tokens. Placeholder method get_active_bot_tokens() missing in TelegramMonitor.")
-        #      # return # Decide if we should proceed
-        # except Exception as e:
-        #      logger.error(f"Error fetching active bot tokens: {e}", exc_info=True)
-        #      # return # Decide if we should proceed
-        # --- END SECTION --- 
+        # Fetch active tokens from MongoDB
+        try:
+            active_tokens = await self.mongo_manager.get_active_bot_tokens() 
+            if not active_tokens:
+                logger.warning("MongoDB returned no active bot tokens to register webhooks for.")
+        except PyMongoError as e: # Make sure PyMongoError is imported if not already
+            logger.error(f"Database error fetching active bot tokens: {e}", exc_info=True)
+            # Decide if we should proceed without tokens or raise/exit
+            active_tokens = [] # Ensure it's empty on error
+        except Exception as e:
+            logger.error(f"Unexpected error fetching active bot tokens: {e}", exc_info=True)
+            active_tokens = [] # Ensure it's empty on error
 
         if not active_tokens:
              logger.warning("No active bot tokens found or fetched. Cannot register webhooks.")

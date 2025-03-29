@@ -176,10 +176,13 @@ async def startup_event():
     logger.info("Initializing Coordinator...")
     await coordinator.initialize()
     
-    # TODO: Add logic here or in Coordinator to set webhooks for active bots
-    # This replaces the old start_monitoring() call which started polling.
-    # We might need a new method like coordinator.register_webhooks()
-    logger.info("Registering webhooks (placeholder)...") 
+    # Register webhooks for active bots using the provided URL
+    webhook_base_url = "https://webhook.xenoops.net"
+    logger.info(f"Registering webhooks with base URL: {webhook_base_url}")
+    await coordinator.register_webhooks(webhook_base_url)
+    
+    # The old start_monitoring() call is removed as webhooks replace polling.
+    # logger.info("Registering webhooks (placeholder)...") 
     # Example: await coordinator.register_webhooks("https://webhook.xenoops.net/webhook") 
     
     logger.info("Coordinator initialized and webhooks set.")
