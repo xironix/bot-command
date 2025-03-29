@@ -7,7 +7,7 @@ and retrieving intercepted data from stealer bots.
 
 import logging
 from datetime import datetime, timedelta
-from typing import Dict, List, Any, Optional
+from typing import Dict, List, Any, Optional, Union
 
 import motor.motor_asyncio
 from pymongo import MongoClient, IndexModel, ASCENDING, DESCENDING, HASHED, TEXT
@@ -43,6 +43,7 @@ class MongoDBManager:
         self.system_info = self.async_db[self.config.system_info_collection]
         self.logs = self.async_db[self.config.log_collection]
         self.stats = self.async_db["parser_stats"]  # Collection for parser statistics
+        self.monitored_bots = self.async_db[self.config.bot_collection]  # New collection for bot tokens
         
         # Set up indexes
         self._setup_indexes()
@@ -87,6 +88,15 @@ class MongoDBManager:
                 IndexModel([("timestamp", ASCENDING)], 
                            expireAfterSeconds=self.config.ttl_days * 86400, 
                            name="logs_ttl")
+            ])
+            
+            # Bot token indexes
+            self.sync_db[self.config.bot_collection].create_indexes([
+                IndexModel([("token", ASCENDING)], unique=True),
+                IndexModel([("username", ASCENDING)], sparse=True),
+                IndexModel([("status", ASCENDING)]),
+                IndexModel([("last_checked", ASCENDING)]),
+                IndexModel([("failure_count", ASCENDING)])
             ])
             
             logger.info("MongoDB indexes created successfully")
@@ -344,6 +354,131 @@ class MongoDBManager:
             logger.error(f"Failed to get credential stats: {str(e)}")
             raise
             
+    async def add_bot_token(self, token: str, username: Optional[str] = None) -> bool:
+        """
+        Add a new bot token to monitor.
+        
+        Args:
+            token: Bot token
+            username: Bot username (optional, can be fetched later)
+            
+        Returns:
+            bool: True if successful, False if token already exists
+        """
+        try:
+            now = datetime.utcnow()
+            await self.monitored_bots.insert_one({
+                "token": token,
+                "username": username,
+                "status": "active",
+                "added_at": now,
+                "last_checked": None,
+                "failure_count": 0,
+                "last_failure": None,
+                "last_success": None
+            })
+            return True
+        except PyMongoError as e:
+            if "duplicate key" in str(e):
+                return False
+            raise
+
+    async def get_active_bot_tokens(self) -> List[str]:
+        """
+        Get list of active bot tokens.
+        
+        Returns:
+            List of active bot tokens
+        """
+        cursor = self.monitored_bots.find(
+            {"status": "active"},
+            projection={"token": 1, "_id": 0}
+        )
+        tokens = []
+        async for doc in cursor:
+            tokens.append(doc["token"])
+        return tokens
+
+    async def update_bot_status(self, token: str, *, 
+                              status: Optional[str] = None,
+                              username: Optional[str] = None,
+                              increment_failures: bool = False,
+                              success: bool = False) -> bool:
+        """
+        Update bot token status and metadata.
+        
+        Args:
+            token: Bot token
+            status: New status (active/inactive)
+            username: Bot username to update
+            increment_failures: Whether to increment failure count
+            success: Whether to record successful check
+            
+        Returns:
+            bool: True if update was successful
+        """
+        now = datetime.utcnow()
+        update: Dict[str, Any] = {"$set": {"last_checked": now}}
+        
+        if status:
+            update["$set"]["status"] = status
+        
+        if username:
+            update["$set"]["username"] = username
+            
+        if increment_failures:
+            update["$inc"] = {"failure_count": 1}
+            update["$set"]["last_failure"] = now
+        
+        if success:
+            if "$set" not in update:
+                update["$set"] = {}
+            update["$set"].update({
+                "last_success": now,
+                "failure_count": 0  # Reset failures on success
+            })
+            
+        result = await self.monitored_bots.update_one(
+            {"token": token},
+            update
+        )
+        return result.modified_count > 0
+
+    async def remove_bot_token(self, token: str) -> bool:
+        """
+        Remove a bot token from monitoring.
+        
+        Args:
+            token: Bot token to remove
+            
+        Returns:
+            bool: True if token was found and removed
+        """
+        result = await self.monitored_bots.delete_one({"token": token})
+        return result.deleted_count > 0
+
+    async def get_bot_info(self, token: Optional[str] = None, username: Optional[str] = None) -> Optional[Dict[str, Any]]:
+        """
+        Get information about a monitored bot.
+        
+        Args:
+            token: Bot token (optional)
+            username: Bot username (optional)
+            
+        Returns:
+            Bot information or None if not found
+        """
+        if not token and not username:
+            return None
+            
+        query = {}
+        if token:
+            query["token"] = token
+        elif username:
+            query["username"] = username
+            
+        return await self.monitored_bots.find_one(query)
+
     def close(self):
         """Close MongoDB connections."""
         self.sync_client.close()

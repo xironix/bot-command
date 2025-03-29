@@ -17,6 +17,8 @@ env/
 *.db-journal
 *.sqlite
 *.sqlite3
+*.session  # Telegram session files
+*.session-journal
 
 # Log files
 logs/
@@ -25,6 +27,13 @@ logs/
 # Data directories
 data/json_logs/
 data/captured/
+downloads/  # Downloaded media files
+temp_extracted/  # Temporary extraction directory
+
+# Database
+mongodb/
+dump/
+*.mongodb
 
 # IDE-specific files
 .idea/
@@ -34,3 +43,20 @@ data/captured/
 
 # macOS files
 .DS_Store
+.AppleDouble
+.LSOverride
+Icon?
+._*
+
+# Windows files
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# Temporary files
+*.tmp
+*.bak
+*.swp
+*~
+bot_monitor_session.session

@@ -114,7 +114,7 @@ class MessageParser:
         # Add JSON detection patterns for identifying JSON-formatted logs
         self._json_patterns = [
             # Standard JSON object pattern
-            re.compile(r"\{\s*"[^"]+"\s*:\s*[\"{[]")
+            re.compile(r'\{\s*"[^"]+"\s*:\s*["{[]')
         ]
         
     def _initialize_plugins(self):

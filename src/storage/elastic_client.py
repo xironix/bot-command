@@ -7,8 +7,10 @@ storing, retrieving, and analyzing intercepted data.
 
 import json
 import logging
+import os  # Import os module
 from datetime import datetime, timedelta
 from typing import Dict, List, Any, Optional
+from urllib.parse import urlparse # Added import
 
 from elasticsearch import AsyncElasticsearch, NotFoundError
 from elasticsearch.helpers import async_bulk
@@ -23,7 +25,30 @@ class ElasticsearchManager:
     def __init__(self):
         """Initialize Elasticsearch manager."""
         self.config = config.elasticsearch
-        self.client = AsyncElasticsearch([self.config.uri])
+        
+        # --- Explicitly read auth from environment variables ---
+        es_username = os.getenv("ELASTICSEARCH_USERNAME")
+        es_password = os.getenv("ELASTICSEARCH_PASSWORD")
+        auth_params = {}
+        if es_username and es_password:
+            auth_params['basic_auth'] = (es_username, es_password)
+            logger.info("Using Elasticsearch Basic authentication.")
+        else:
+            logger.info("No explicit Elasticsearch authentication credentials found in environment.")
+
+        # --- Parse the URI to separate endpoint from potential inline auth ---
+        # logger.debug(f"Raw Elasticsearch URI from config: {self.config.uri}") # Keep this for now
+        print(f"!!! DEBUG: Raw Elasticsearch URI before parse: {self.config.uri}") # <-- ADDED PRINT
+        parsed_uri = urlparse(self.config.uri)
+        print(f"!!! DEBUG: Parsed scheme: {parsed_uri.scheme}") # <-- ADDED PRINT
+        host_uri = f"{parsed_uri.scheme}://{parsed_uri.hostname}:{parsed_uri.port}"
+        logger.info(f"Connecting to Elasticsearch endpoint: {host_uri}")
+
+        self.client = AsyncElasticsearch(
+            [host_uri],         # Use parsed URI without inline auth
+            verify_certs=False, # Disable SSL verification for self-signed certs
+            **auth_params       # Pass basic auth credentials separately
+        )
         
         # Index names
         self.credentials_index = f"{self.config.index_prefix}-credentials"

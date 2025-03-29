@@ -23,14 +23,14 @@ class MongoDBConfig(BaseModel):
     cookie_collection: str = Field(default="cookies", description="Collection for stolen cookies")
     system_info_collection: str = Field(default="system_info", description="Collection for system information")
     log_collection: str = Field(default="logs", description="Collection for activity logs")
+    bot_collection: str = Field(default="monitored_bots", description="Collection for monitored bot tokens")
     ttl_days: int = Field(default=30, description="Days to keep data before expiration")
 
 # Telegram API settings
 class TelegramConfig(BaseModel):
     api_id: int = Field(description="Telegram API ID")
     api_hash: str = Field(description="Telegram API hash")
-    bot_tokens: List[str] = Field(default=[], description="List of Telegram bot tokens to monitor")
-    bot_usernames: List[str] = Field(default=[], description="List of Telegram bot usernames to monitor")
+    bot_usernames: List[str] = Field(default=[], description="List of Telegram bot usernames to explicitly monitor (auto-populated from tokens)")
     bot_blocklist: List[str] = Field(default=[], description="List of Telegram bot usernames to ignore")
     monitor_all_bots: bool = Field(default=False, description="Monitor all bots encountered")
     filter_by_patterns: bool = Field(default=True, description="Use patterns to identify stealer bots")
@@ -39,7 +39,10 @@ class TelegramConfig(BaseModel):
 
 # Elasticsearch settings
 class ElasticsearchConfig(BaseModel):
-    uri: str = Field(default="http://localhost:9200", description="Elasticsearch connection URI")
+    uri: str = Field(
+        default=os.getenv("ELASTICSEARCH_URI", "https://localhost:9200"),
+        description="Elasticsearch connection URI"
+    )
     kibana_uri: str = Field(default="http://localhost:5601", description="Kibana connection URI")
     index_prefix: str = Field(default="bot-command", description="Prefix for Elasticsearch indices")
 
@@ -52,7 +55,12 @@ class AppConfig(BaseModel):
         default_factory=lambda: TelegramConfig(
             api_id=int(os.getenv("TELEGRAM_API_ID", "0")),
             api_hash=os.getenv("TELEGRAM_API_HASH", ""),
-            bot_tokens=os.getenv("TELEGRAM_BOT_TOKENS", "").split(",") if os.getenv("TELEGRAM_BOT_TOKENS") else []
+            bot_usernames=os.getenv("TELEGRAM_BOT_USERNAMES", "").split(",") if os.getenv("TELEGRAM_BOT_USERNAMES") else [],
+            bot_blocklist=os.getenv("TELEGRAM_BOT_BLOCKLIST", "").split(",") if os.getenv("TELEGRAM_BOT_BLOCKLIST") else [],
+            monitor_all_bots=os.getenv("MONITOR_ALL_BOTS", "").lower() == "true",
+            filter_by_patterns=os.getenv("FILTER_BY_PATTERNS", "true").lower() == "true",
+            phone_number=os.getenv("TELEGRAM_PHONE_NUMBER"),
+            session_name=os.getenv("TELEGRAM_SESSION_NAME", "bot_monitor_session")
         )
     )
     elasticsearch: ElasticsearchConfig = Field(default_factory=ElasticsearchConfig)

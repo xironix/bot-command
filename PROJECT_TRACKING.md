@@ -94,4 +94,8 @@ This file tracks the progress of the bot-command project - a covert intelligence
 8. Complete advanced Kibana dashboards with parser performance metrics
 9. Implement value scoring aggregation to identify high-value targets
 
+## Recent Improvements
+- Fixed concurrency bugs in shared state (message_parser.stats) using asyncio.Lock
+- Implemented dynamic bot username retrieval using Telegram API instead of relying on hardcoded usernames
+
 Last updated: March 29, 2025

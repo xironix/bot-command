@@ -79,6 +79,10 @@ class TelegramMonitor:
         # Clean up any leftover files from previous runs
         await self._cleanup_old_downloads()
         
+        # Get information about the bots from their tokens
+        if self.config.bot_tokens:
+            await self._retrieve_bot_info_from_tokens()
+        
     async def _automated_login(self):
         """Attempt to log in without user interaction using environment variables."""
         if not self.config.phone_number:
@@ -394,6 +398,82 @@ class TelegramMonitor:
         except Exception as e:
             logger.error(f"Error in media cleanup task: {str(e)}")
             
+    async def _retrieve_bot_info_from_tokens(self):
+        """
+        Dynamically retrieve bot information from provided bot tokens.
+        This avoids the need to manually specify bot usernames in the config.
+        """
+        import aiohttp
+        
+        # Don't do anything if no tokens are provided
+        if not self.config.bot_tokens:
+            logger.info("No bot tokens provided, skipping bot info retrieval")
+            return
+            
+        logger.info(f"Retrieving information for {len(self.config.bot_tokens)} bot tokens")
+        
+        # Set to collect bot usernames
+        retrieved_usernames = set()
+        
+        # Process each token
+        for token in self.config.bot_tokens:
+            try:
+                # Use aiohttp instead of requests for async compatibility
+                async with aiohttp.ClientSession() as session:
+                    url = f"https://api.telegram.org/bot{token}/getMe"
+                    async with session.get(url) as response:
+                        if response.status == 200:
+                            data = await response.json()
+                            
+                            if data.get("ok") and "result" in data:
+                                bot_info = data["result"]
+                                bot_username = bot_info.get("username")
+                                
+                                if bot_username:
+                                    logger.info(f"Successfully retrieved info for bot: {bot_username}")
+                                    retrieved_usernames.add(bot_username)
+                                    
+                                    # Store additional bot information if needed
+                                    # This could be expanded to store more metadata
+                                    bot_data = {
+                                        "id": bot_info.get("id"),
+                                        "first_name": bot_info.get("first_name"),
+                                        "username": bot_username,
+                                        "is_bot": bot_info.get("is_bot", True),
+                                        "token": token,
+                                        "retrieved_at": datetime.utcnow()
+                                    }
+                                    
+                                    # Store this info for later use if needed
+                                    # This is just in memory, but could be persisted in a database
+                                    if not hasattr(self, "_bot_info_cache"):
+                                        self._bot_info_cache = {}
+                                    self._bot_info_cache[bot_username] = bot_data
+                                    
+                                else:
+                                    logger.warning(f"Bot info retrieved but no username found for token: {token[:5]}...")
+                            else:
+                                logger.warning(f"Failed to retrieve bot info: {data.get('description', 'Unknown error')}")
+                        else:
+                            logger.warning(f"Failed to retrieve bot info, status code: {response.status}")
+            except Exception as e:
+                logger.error(f"Error retrieving bot info for token {token[:5]}...: {str(e)}")
+                
+        # Merge retrieved usernames with manually configured ones
+        if retrieved_usernames:
+            # Convert existing usernames to a set for deduplication
+            existing_usernames = set(self.config.bot_usernames)
+            
+            # Merge sets
+            all_usernames = existing_usernames.union(retrieved_usernames)
+            
+            # Update config with the combined list
+            self.config.bot_usernames = list(all_usernames)
+            
+            logger.info(f"Updated bot usernames list, now monitoring {len(self.config.bot_usernames)} bots")
+        else:
+            logger.warning("No bot usernames could be retrieved from tokens")
+    
     async def close(self):
         """Close Telegram clients."""
         if self._main_client:

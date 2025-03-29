@@ -194,7 +194,7 @@ class RedLineParser(StealerParserPlugin):
                     wallet_type = "bitcoin"
                 elif pattern.pattern.startswith("Ethereum"):
                     wallet_type = "ethereum"
-                elif pattern.pattern.startswith("wallet\.dat"):
+                elif pattern.pattern.startswith(r"wallet\.dat"):
                     wallet_type = "bitcoin"
                     
                 result["crypto_wallets"].append({

@@ -23,58 +23,39 @@ Bot-Command monitors Telegram-based stealer bots without modifying their behavio
 ## Installation
 
 1. Clone the repository:
+
    ```
    git clone https://github.com/yourusername/bot-command.git
    cd bot-command
    ```
-
 2. Install dependencies:
-   ```
-   pip install -r requirements.txt
-   ```
 
+   ```
+   uv sync
+   ```
 3. Copy the example environment file and modify it:
+
    ```
    cp .env.example .env
    nano .env  # Edit with your credentials
    ```
 
    Required environment variables:
+
    ```
    # Telegram API credentials (required)
    TELEGRAM_API_ID=your_api_id_here
    TELEGRAM_API_HASH=your_api_hash_here
-   
+
    # MongoDB credentials
    MONGODB_USERNAME=botcommand
    MONGODB_PASSWORD=your_secure_password
-   
+
    # Optional configurations
    LOG_LEVEL=INFO  # DEBUG, INFO, WARNING, ERROR, CRITICAL
    MEDIA_RETENTION_DAYS=30
    MAX_DISK_USAGE_GB=10
    ```
-
-4. Set up the Docker environment:
-   ```
-   # Start MongoDB, Elasticsearch, and Kibana containers
-   python setup_docker.py --all
-   ```
-
-## Usage
-
-1. Ensure Docker services are running:
-   ```
-   docker-compose ps
-   ```
-
-2. Run the main application:
-   ```
-   python main.py
-   ```
-
-3. Access the dashboards:
-   - Kibana: http://localhost:5601
 
 ## Configuration
 
@@ -87,8 +68,9 @@ You can control which Telegram bots to monitor with these options:
 ```
 # In your .env file:
 
-# Specific bots to monitor (comma-separated)
-TELEGRAM_BOT_USERNAMES=stealerbot1,infobot2,datacollector3
+# Bot tokens to monitor (comma-separated)
+# Bot usernames will be automatically retrieved from these tokens
+TELEGRAM_BOT_TOKENS=123456789:ABCdefGHIjklMNOpqrsTUVwxyz,987654321:ZYXwvuTSRqpONMlkjIHGfedCBA
 
 # Bots to always ignore (comma-separated)
 TELEGRAM_BOT_BLOCKLIST=goodbot1,legitimatebot2
@@ -100,7 +82,7 @@ MONITOR_ALL_BOTS=false
 FILTER_BY_PATTERNS=true
 ```
 
-These settings let you control the scope of your monitoring, from targeting specific bots to monitoring all suspicious bots based on pattern matching.
+These settings let you control the scope of your monitoring, from targeting specific bots to monitoring all suspicious bots based on pattern matching. The recommended approach is to provide bot tokens in `TELEGRAM_BOT_TOKENS` and let the system automatically retrieve the usernames.
 
 ### Media File Management
 

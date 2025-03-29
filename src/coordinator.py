@@ -290,6 +290,12 @@ class Coordinator:
                         metadata
                     )
                     
+        except asyncio.CancelledError:
+            # Task was cancelled, exit gracefully
+            logger.debug("Process extracted data task cancelled")
+        except Exception as e:
+            logger.error(f"Error in process extracted data: {str(e)}", exc_info=True)
+
     async def _report_stats_periodically(self):
         """
         Report parser statistics periodically.

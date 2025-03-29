@@ -6,6 +6,10 @@ This tool silently intercepts and replicates the data collection process of
 Telegram-based stealer bots without modifying their behavior or alerting operators.
 """
 
+# Load environment variables FIRST, before any other project imports
+from dotenv import load_dotenv
+load_dotenv()
+
 import asyncio
 import argparse
 import logging
@@ -14,12 +18,9 @@ import signal
 import sys
 from datetime import datetime
 from logging.handlers import RotatingFileHandler
-from dotenv import load_dotenv
 
+# Now import project modules AFTER dotenv is loaded
 from src.coordinator import Coordinator
-
-# Load environment variables
-load_dotenv()
 
 # Create logs directory if it doesn't exist
 os.makedirs("logs", exist_ok=True)
@@ -72,7 +73,6 @@ def purge_old_logs(log_dir="logs", max_days=30):
             return
             
         import time
-        from datetime import timedelta
         
         logger.info(f"Purging log files older than {max_days} days")
         
@@ -131,25 +131,33 @@ async def main():
     
     # Parse command line arguments
     args = parse_arguments()
-    
-    # Override log level from command line if specified
+
+    # --- Set log level based on args *before* initializing components ---
+    initial_log_level = logging.INFO # Default
     if args.log_level:
         log_level_name = args.log_level.upper()
-        log_level = getattr(logging, log_level_name, logging.INFO)
-        logging.getLogger().setLevel(log_level)
-        logger.info(f"Log level set to {log_level_name}")
-    
+        initial_log_level = getattr(logging, log_level_name, logging.INFO)
+    elif args.debug:
+        # If --debug is used and --log-level isn't, set level to DEBUG
+        initial_log_level = logging.DEBUG
+        logger.info("Debug flag detected, setting initial log level to DEBUG")
+
+    # Apply the determined initial log level globally
+    logging.getLogger().setLevel(initial_log_level)
+    if initial_log_level != logging.INFO:
+        logger.info(f"Initial log level set to {logging.getLevelName(initial_log_level)}")
+
     # Clean up old log files
     purge_old_logs()
     
     logger.info("Starting Bot-Command...")
     
-    # Create and initialize the coordinator
+    # Create and initialize the coordinator (now logging level is set)
     coordinator = Coordinator()
     
-    # Enable debug mode if requested
+    # Enable specific debug features if requested (separate from log level)
     if args.debug:
-        logger.info(f"Debug mode enabled, output will be saved to {args.debug_dir}")
+        logger.info(f"Enabling specific debug features, output will be saved to {args.debug_dir}")
         coordinator.enable_debug_mode(args.debug_dir)
     
     await coordinator.initialize()
