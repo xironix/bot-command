@@ -59,4 +59,4 @@ $RECYCLE.BIN/
 *.bak
 *.swp
 *~
-bot_monitor_session.session
+*.session
