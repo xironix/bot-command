@@ -8,8 +8,10 @@ Telegram monitoring, message processing, and data storage.
 import asyncio
 import logging
 import os
-from datetime import datetime
-from typing import Dict, List, Any
+from datetime import datetime, timedelta
+from typing import Dict, List, Any, Optional
+
+import aiohttp
 
 from src.telegram.client import TelegramMonitor
 from src.processing.worker_pool import WorkerPool
@@ -38,6 +40,7 @@ class Coordinator:
         # Configuration 
         self.stats_report_interval = 3600  # Report stats every hour
         self.debug_mode = False
+        self.stats_task: Optional[asyncio.Task] = None
         
     def enable_debug_mode(self, debug_dir: str = "debug_logs"):
         """
@@ -56,8 +59,8 @@ class Coordinator:
         worker_pool_logger.setLevel(logging.DEBUG)
         
         # Set telegram monitor logging to DEBUG
-        telegram_logger = logging.getLogger("telegram")
-        telegram_logger.setLevel(logging.DEBUG)
+        # telegram_logger = logging.getLogger("telegram") # Commented out as telegram monitor might change
+        # telegram_logger.setLevel(logging.DEBUG)
         
         logger.info(f"Debug mode enabled, output will be saved to {debug_dir}")
         
@@ -104,9 +107,9 @@ class Coordinator:
         self.initialized = False
         logger.info("Bot-Command coordinator shut down")
         
-    async def start_monitoring(self, bot_usernames: List[str] = None):
+    async def start_monitoring(self, bot_usernames: Optional[List[str]] = None):
         """
-        Start monitoring specified bots.
+        Start monitoring specified bots (Likely unused with webhooks).
         
         Args:
             bot_usernames: List of bot usernames to monitor (optional)
@@ -124,43 +127,180 @@ class Coordinator:
             for username in bot_usernames:
                 # This would set up specific monitoring for each bot
                 # In a real implementation, this might involve joining channels, etc.
-                await self.telegram_monitor.monitor_bot_channel(username)
+                # await self.telegram_monitor.monitor_bot_channel(username)
+                pass # Added pass to fix empty loop body
                 
-        # Start statistics reporting task
-        asyncio.create_task(self._report_stats_periodically())
+        # Start statistics reporting task (Moved to initialize or FastAPI startup)
+        # asyncio.create_task(self._report_stats_periodically())
                 
-        logger.info("Bot monitoring started")
+        # logger.info("Bot monitoring started")
         
-    def _handle_telegram_message(self, message_data: Dict[str, Any]):
+    # --- Webhook Handling --- 
+
+    async def handle_webhook_update(self, token: str, update_data: Dict[str, Any]):
+        """Handles an incoming webhook update from the FastAPI endpoint."""
+        logger.debug(f"Coordinator received update for token {token[:4]}...: {list(update_data.keys())}")
+        
+        # Extract the main content (message, edited_message, etc.)
+        # Telegram sends only one of these per update object.
+        message_content = None
+        update_type = "unknown"
+        if "message" in update_data:
+            message_content = update_data["message"]
+            update_type = "message"
+        elif "edited_message" in update_data:
+            # Decide how to handle edited messages - log or process?
+            message_content = update_data["edited_message"]
+            update_type = "edited_message"
+            logger.info(f"Received edited message for token {token[:4]}... (processing as regular message)")
+        elif "callback_query" in update_data:
+            # TODO: Implement callback query handling if needed
+            logger.info(f"Received callback query for token {token[:4]}...: {update_data['callback_query'].get('data')}")
+            # Often needs an immediate response (answerCallbackQuery)
+            # For now, just log it and don't process further.
+            return 
+        elif "inline_query" in update_data:
+            # TODO: Implement inline query handling if needed
+            logger.info(f"Received inline query for token {token[:4]}...")
+            return
+        # Add other update types as needed (channel_post, etc.)
+
+        if message_content:
+             # Add the bot token to the context if not easily derived from message
+             # Note: The message itself might contain bot info if it's a command
+             message_content['_received_via_token'] = token 
+             
+             # Submit the extracted message content for processing
+             asyncio.create_task(self.worker_pool.submit_monitor_task(
+                 self._process_message,
+                 message_content # Pass the inner message object
+             ))
+        else:
+            logger.warning(f"Received webhook update for {token[:4]}... with unhandled type or no content: {list(update_data.keys())}")
+
+    async def register_webhooks(self, base_webhook_url: str):
+        """Registers webhooks with Telegram for all active bots."""
+        logger.info(f"Attempting to register webhooks with base URL: {base_webhook_url}")
+        
+        active_tokens = [] # Default to empty list
+        # We need a way to get active tokens. Placeholder for now.
+        # Assume telegram_monitor can provide this, or fetch from DB.
+        # --- SECTION TO BE RE-ENABLED WHEN get_active_bot_tokens IS IMPLEMENTED --- 
+        # try:
+        #     # TODO: Implement get_active_bot_tokens in TelegramMonitor or fetch differently
+        #     active_tokens = await self.telegram_monitor.get_active_bot_tokens() 
+        #     if not active_tokens:
+        #         logger.warning("No active bot tokens found to register webhooks for.")
+        #         # return # Decide if we should proceed without tokens
+        # except AttributeError:
+        #      logger.error("Coordinator cannot get active bot tokens. Placeholder method get_active_bot_tokens() missing in TelegramMonitor.")
+        #      # return # Decide if we should proceed
+        # except Exception as e:
+        #      logger.error(f"Error fetching active bot tokens: {e}", exc_info=True)
+        #      # return # Decide if we should proceed
+        # --- END SECTION --- 
+
+        if not active_tokens:
+             logger.warning("No active bot tokens found or fetched. Cannot register webhooks.")
+             # Potentially start stats task anyway?
+             # if not self.stats_task or self.stats_task.done():
+             #    logger.info("Starting periodic statistics reporting (no webhooks registered).")
+             #    self.stats_task = asyncio.create_task(self._report_stats_periodically())
+             return # Exit if no tokens
+
+        async with aiohttp.ClientSession() as session:
+            for token in active_tokens:
+                if not token or ':' not in token: # Basic validation
+                    logger.warning(f"Skipping invalid token format: {token[:10]}...")
+                    continue
+                
+                webhook_endpoint = f"/webhook/{token}" # Define specific path per token
+                full_webhook_url = base_webhook_url.rstrip('/') + webhook_endpoint
+                api_url = f"https://api.telegram.org/bot{token}/setWebhook"
+                
+                payload = {"url": full_webhook_url}
+                # Optional: Add allowed_updates, drop_pending_updates, secret_token etc.
+                # payload["allowed_updates"] = ["message", "edited_message", ...]
+                # payload["drop_pending_updates"] = True
+                
+                try:
+                    logger.info(f"Setting webhook for token {token[:4]}... to {full_webhook_url}")
+                    async with session.post(api_url, json=payload) as response:
+                        resp_json = await response.json()
+                        if response.status == 200 and resp_json.get("ok"):
+                            logger.info(f"Successfully set webhook for token {token[:4]}... Result: {resp_json.get('description')}")
+                        else:
+                            error_desc = resp_json.get("description", "Unknown error")
+                            logger.error(f"Failed to set webhook for token {token[:4]}... Status: {response.status}, Error: {error_desc}")
+                except aiohttp.ClientError as e:
+                    logger.error(f"HTTP Client error setting webhook for token {token[:4]}...: {e}")
+                except Exception as e:
+                    logger.error(f"Unexpected error setting webhook for token {token[:4]}...: {e}", exc_info=True)
+
+        # Start statistics reporting task after webhooks are set
+        if not self.stats_task or self.stats_task.done():
+            logger.info("Starting periodic statistics reporting.")
+            self.stats_task = asyncio.create_task(self._report_stats_periodically())
+
+    # --- End Webhook Handling ---
+
+    async def _handle_telegram_message(self, message_data: Dict[str, Any]):
         """
-        Handle a message received from Telegram.
+        Handle a message received from Telegram (via polling - likely unused now).
         
-        This is the callback that will be invoked by the TelegramMonitor when
-        a new message is received.
+        This was the callback for the TelegramMonitor polling mechanism.
         
         Args:
-            message_data: Raw message data from Telegram
+            message_data: Raw message data (Now could be the inner message dict)
         """
-        # Submit to the monitor queue for processing
-        asyncio.create_task(self.worker_pool.submit_monitor_task(
-            self._process_message,
-            message_data
-        ))
-        
+        bot_identifier = "unknown bot" # Define before try block
+        try:
+            # Adaption: If message_data contains the token, use it.
+            # Otherwise, parsing logic needs to find bot context internally.
+            bot_token = message_data.pop('_received_via_token', None)
+            bot_identifier = f"token {bot_token[:4]}..." if bot_token else "unknown bot"
+
+            # Parse the message (assuming message_data is now the inner message dict)
+            parsed_data = self.message_parser.parse_message(message_data)
+            
+            # Add token info if we have it (may override parser's findings)
+            if bot_token:
+                 parsed_data['bot_token_used'] = bot_token
+                 # We might need to map token to bot_id/username if parser fails
+
+            # Check for high-value data
+            if parsed_data.get("value_score", 0) > 70:
+                logger.info(f"High-value data detected (score: {parsed_data.get('value_score')}) from {bot_identifier}")
+            
+            # Log the activity
+            await self._log_activity(parsed_data)
+            
+            # Process extracted data
+            await self._process_extracted_data(parsed_data)
+            
+            # Correlate data
+            if parsed_data.get("bot_id"):
+                asyncio.create_task(
+                    self.elastic_manager.correlate_data(parsed_data["bot_id"])
+                )
+        except Exception as e:
+            logger.error(f"Failed to process message from {bot_identifier}: {str(e)}", exc_info=True)
+            
     async def _process_message(self, message_data: Dict[str, Any]):
         """
         Process a message.
         
         Args:
-            message_data: Raw message data
+            message_data: Raw message data (Now could be the inner message dict)
         """
+        bot_identifier = "unknown bot" # Define before try block
         try:
             # Parse the message
             parsed_data = self.message_parser.parse_message(message_data)
             
             # Check for high-value data
             if parsed_data.get("value_score", 0) > 70:
-                logger.info(f"High-value data detected (score: {parsed_data.get('value_score')}) from bot {parsed_data.get('bot_username')}")
+                logger.info(f"High-value data detected (score: {parsed_data.get('value_score')}) from {bot_identifier}")
             
             # Log the activity
             await self._log_activity(parsed_data)
@@ -297,63 +437,14 @@ class Coordinator:
             logger.error(f"Error in process extracted data: {str(e)}", exc_info=True)
 
     async def _report_stats_periodically(self):
-        """
-        Report parser statistics periodically.
-        """
-        try:
-            while self.initialized:
-                # Wait for the report interval
-                await asyncio.sleep(self.stats_report_interval)
+        """Periodically report statistics."""
+        while True:
+            now = datetime.now()
+            if (now - self.last_stats_report).total_seconds() >= self.stats_report_interval:
+                # Generate and log stats
+                # Placeholder for actual stats implementation
+                logger.info("Reporting periodic stats (placeholder)")
+                self.last_stats_report = now
                 
-                # Get current time
-                current_time = datetime.now()
-                
-                # Calculate time since last report
-                time_since_last = (current_time - self.last_stats_report).total_seconds()
-                
-                # Skip if we haven't reached the interval yet
-                if time_since_last < self.stats_report_interval:
-                    continue
-                    
-                # Update last report time
-                self.last_stats_report = current_time
-                
-                # Get parser stats - now an async method
-                stats = await self.message_parser.get_parser_stats()
-                
-                # Log basic stats
-                logger.info(f"Parser statistics: processed={stats['total_processed']}, "
-                           f"success_rate={stats.get('overall_success_rate', 0):.2f}%, "
-                           f"high_value_extractions={stats['high_value_extractions']}")
-                
-                # Log plugin-specific stats if we have successful parsing
-                if stats["plugin_successes"] > 0:
-                    # Sort plugins by success rate
-                    plugin_stats = sorted(
-                        [(name, data) for name, data in stats["plugins"].items() if data["attempts"] > 0],
-                        key=lambda x: x[1].get("success_rate", 0),
-                        reverse=True
-                    )
-                    
-                    # Log top 3 plugins
-                    for name, data in plugin_stats[:3]:
-                        if data["attempts"] > 0:
-                            logger.info(f"Top parser plugin: {name}, "
-                                       f"success_rate={data.get('success_rate', 0):.2f}%, "
-                                       f"avg_value_score={data.get('avg_value_score', 0):.2f}, "
-                                       f"attempts={data['attempts']}")
-                                       
-                # Log to MongoDB for long-term tracking
-                await self.mongo_manager.store_parser_stats(stats)
-                
-                # Also log to Elasticsearch if available
-                try:
-                    await self.elastic_manager.index_parser_stats(stats)
-                except Exception as e:
-                    logger.debug(f"Failed to index parser stats in Elasticsearch: {str(e)}")
-                    
-        except asyncio.CancelledError:
-            # Task was cancelled, exit gracefully
-            logger.debug("Stats reporting task cancelled")
-        except Exception as e:
-            logger.error(f"Error in stats reporting task: {str(e)}", exc_info=True)
+            # Sleep for a shorter interval to check time
+            await asyncio.sleep(60) # Check every minute

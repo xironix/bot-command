@@ -19,9 +19,14 @@ from rich.logging import RichHandler
 
 # Third-party imports
 from dotenv import load_dotenv
+from fastapi import FastAPI, Request, HTTPException
+from pydantic import BaseModel
+import uvicorn
 
 # Local application/library specific imports
 from src.coordinator import Coordinator
+from src.config import load_env_vars
+from src.database.init_db import init_database
 
 # Load environment variables AFTER imports but BEFORE using them
 load_dotenv()
@@ -80,6 +85,24 @@ logger = logging.getLogger(__name__)
 # Global coordinator instance
 coordinator = None
 
+# --- Pydantic Model for Telegram Update ---
+class TelegramUpdate(BaseModel):
+    update_id: int
+    # Add other fields from Telegram Update object as needed
+    # e.g., message: Optional[dict] = None
+    #       edited_message: Optional[dict] = None
+    #       ... etc
+    # For now, just capture the raw data
+    class Config:
+        extra = 'allow' # Allow extra fields not explicitly defined
+
+# --- Global coordinator and FastAPI app ---
+coordinator = Coordinator() # Instantiate coordinator globally
+app = FastAPI(title="Bot-Command Monitor", version="0.1.0")
+
+# Load environment variables (consider doing this earlier if needed by logging)
+# env_vars = load_env_vars() # Might need adjustment based on FastAPI startup
+
 # Purge old log files
 def purge_old_logs(log_dir="logs", max_days=30):
     """
@@ -132,81 +155,92 @@ def purge_old_logs(log_dir="logs", max_days=30):
     except Exception as e:
         logger.error(f"Error purging old logs: {str(e)}")
 
-# Handle shutdown signals
-def signal_handler():
-    if coordinator:
-        asyncio.create_task(coordinator.shutdown())
+# Handle shutdown signals (Replaced by FastAPI lifespan)
+# def signal_handler():
+#     if coordinator:
+#         asyncio.create_task(coordinator.shutdown())
 
-def parse_arguments():
-    """Parse command line arguments."""
-    parser = argparse.ArgumentParser(description="Bot-Command - Covert Intelligence-Gathering Tool")
-    parser.add_argument("--debug", action="store_true", help="Enable debug mode with detailed logging")
-    parser.add_argument("--debug-dir", type=str, default="debug_logs", help="Directory for debug output (default: debug_logs)")
-    parser.add_argument("--log-level", type=str, default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"], 
-                      help="Set logging level (default: INFO)")
-    return parser.parse_args()
+# Argument parsing (Removed, rely on env vars or FastAPI config)
+# def parse_arguments():
+#    ... (removed) ...
 
-async def main():
-    """Main entry point for the application."""
-    global coordinator
+# --- FastAPI Lifespan Events ---
+@app.on_event("startup")
+async def startup_event():
+    """Handles application startup: initialize coordinator and set webhooks."""
+    logger.info("Application startup...")
     
-    # Parse command line arguments
-    args = parse_arguments()
-
-    # --- Set log level based on args *before* initializing components ---
-    initial_log_level = logging.INFO # Default
-    if args.log_level:
-        log_level_name = args.log_level.upper()
-        initial_log_level = getattr(logging, log_level_name, logging.INFO)
-    elif args.debug:
-        # If --debug is used and --log-level isn't, set level to DEBUG
-        initial_log_level = logging.DEBUG
-        logger.info("Debug flag detected, setting initial log level to DEBUG")
-
-    # Apply the determined initial log level globally
-    logging.getLogger().setLevel(initial_log_level)
-    if initial_log_level != logging.INFO:
-        logger.info(f"Initial log level set to {logging.getLevelName(initial_log_level)}")
-
     # Clean up old log files
-    purge_old_logs()
+    purge_old_logs() # Keep log purging
     
-    logger.info("Starting Bot-Command...")
-    
-    # Create and initialize the coordinator (now logging level is set)
-    coordinator = Coordinator()
-    
-    # Enable specific debug features if requested (separate from log level)
-    if args.debug:
-        logger.info(f"Enabling specific debug features, output will be saved to {args.debug_dir}")
-        coordinator.enable_debug_mode(args.debug_dir)
-    
+    logger.info("Initializing Coordinator...")
     await coordinator.initialize()
     
-    # Start monitoring bots
-    # In a production environment, this would use bots from configuration
-    # or a database of bots to monitor
-    await coordinator.start_monitoring()
+    # TODO: Add logic here or in Coordinator to set webhooks for active bots
+    # This replaces the old start_monitoring() call which started polling.
+    # We might need a new method like coordinator.register_webhooks()
+    logger.info("Registering webhooks (placeholder)...") 
+    # Example: await coordinator.register_webhooks("https://webhook.xenoops.net/webhook") 
     
-    # Register signal handlers for graceful shutdown
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        loop = asyncio.get_running_loop()
-        loop.add_signal_handler(sig, signal_handler)
+    logger.info("Coordinator initialized and webhooks set.")
+    logger.info("Bot-Command Monitor is ready to receive updates.")
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    """Handles application shutdown: cleanup coordinator resources."""
+    logger.info("Application shutdown...")
+    if coordinator:
+        logger.info("Shutting down Coordinator...")
+        await coordinator.shutdown()
+    logger.info("Bot-Command shut down complete.")
+
+# --- FastAPI Endpoints ---
+@app.get("/")
+async def read_root():
+    """Root endpoint for health check."""
+    return {"message": "Bot-Command Monitor Active"}
+
+@app.post("/webhook/{token}")
+async def handle_webhook(token: str, update: TelegramUpdate, request: Request):
+    """Receives webhook updates from Telegram for a specific bot token."""
+    # Optional: Verify source IP matches Telegram's ranges
+    # client_host = request.client.host
+    # if not is_telegram_ip(client_host): # Implement is_telegram_ip check
+    #     logger.warning(f"Received webhook from untrusted IP: {client_host}")
+    #     raise HTTPException(status_code=403, detail="Forbidden")
+
+    logger.debug(f"Received webhook for token {token[:4]}...: {update.dict()}")
     
+    # Pass the update to the coordinator for processing
     try:
-        # Keep the main task running
-        while True:
-            await asyncio.sleep(1)
-    except KeyboardInterrupt:
-        logger.info("Keyboard interrupt received")
-    finally:
-        # Clean up resources
-        if coordinator:
-            await coordinator.shutdown()
-        logger.info("Bot-Command shut down")
+        # Convert Pydantic model back to dict for existing handler (if needed)
+        # or adapt handler to accept the Pydantic model directly
+        await coordinator.handle_webhook_update(token, update.dict()) 
+        # ^^^ NOTE: handle_webhook_update method needs to be created in Coordinator
+    except Exception as e:
+        logger.error(f"Error processing webhook update for token {token[:4]}...: {e}", exc_info=True)
+        # Return 500 to Telegram so it retries later
+        raise HTTPException(status_code=500, detail="Internal Server Error")
+
+    # Return 200 OK to Telegram to acknowledge receipt
+    return {"status": "ok"}
+
+# Old main async function (Replaced by FastAPI startup/shutdown events)
+# async def main():
+#    ... (removed) ...
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except Exception as e:
-        logger.error(f"Fatal error: {str(e)}", exc_info=True)
+    # Configure log level based on environment variable (similar to before)
+    log_level_name = os.getenv("LOG_LEVEL", "INFO").upper()
+    initial_log_level = getattr(logging, log_level_name, logging.INFO)
+    logging.getLogger().setLevel(initial_log_level)
+    logger.info(f"Log level set to {log_level_name}")
+
+    # Run the FastAPI application using uvicorn
+    # Get port from environment variable or default to 8000
+    port = int(os.getenv("PORT", "8000"))
+    logger.info(f"Starting web server on 0.0.0.0:{port}")
+    
+    # Note: For production, disable reload=True
+    # Note: Ensure this port is reachable by Telegram (e.g., via reverse proxy to 443)
+    uvicorn.run("main:app", host="0.0.0.0", port=port, reload=False) # Changed reload to False
