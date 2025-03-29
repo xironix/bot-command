@@ -53,7 +53,21 @@ class TelegramMonitor:
             self.config.api_hash
         )
         
-        await self._main_client.start()
+        try:
+            # Try to start client using session file (non-interactive login)
+            await self._main_client.connect()
+            
+            # Check if session is valid
+            if not await self._main_client.is_user_authorized():
+                logger.info("Existing session not valid, attempting to login")
+                await self._automated_login()
+            else:
+                logger.info("Successfully authenticated using existing session")
+                
+        except Exception as e:
+            logger.error(f"Error during Telegram client initialization: {str(e)}")
+            raise
+            
         logger.info("Main Telegram client initialized")
         
         # Set up event handlers
@@ -65,26 +79,43 @@ class TelegramMonitor:
         # Clean up any leftover files from previous runs
         await self._cleanup_old_downloads()
         
-    async def _ensure_logged_in(self):
-        """Ensure the client is logged in."""
-        if not await self._main_client.is_user_authorized():
-            logger.info("User not authorized, proceeding with login")
+    async def _automated_login(self):
+        """Attempt to log in without user interaction using environment variables."""
+        if not self.config.phone_number:
+            logger.error("Phone number is required for Telegram login but not provided in config")
+            raise ValueError("Phone number is required for Telegram login")
             
-            if not self.config.phone_number:
-                raise ValueError("Phone number is required for Telegram login")
-                
-            await self._main_client.send_code_request(self.config.phone_number)
+        phone = self.config.phone_number
+        logger.info(f"Attempting automated login for phone {phone}")
             
-            # This will require user interaction in a production environment
-            # For automated environments, this could be handled via environment variables
-            code = input("Enter the code you received: ")
+        # Define callback functions that will retrieve values from environment variables
+        async def code_callback():
+            code = os.getenv("TELEGRAM_CODE")
+            if not code:
+                logger.error("TELEGRAM_CODE environment variable not set for authentication")
+                raise ValueError("TELEGRAM_CODE environment variable not set")
+            return code
             
-            try:
-                await self._main_client.sign_in(self.config.phone_number, code)
-            except SessionPasswordNeededError:
-                # 2FA enabled
-                password = input("Enter your 2FA password: ")
-                await self._main_client.sign_in(password=password)
+        async def password_callback():
+            password = os.getenv("TELEGRAM_2FA_PASSWORD")
+            if not password:
+                logger.error("TELEGRAM_2FA_PASSWORD environment variable not set for 2FA")
+                raise ValueError("TELEGRAM_2FA_PASSWORD environment variable not set")
+            return password
+            
+        try:
+            # Start the client with the callbacks
+            await self._main_client.start(phone=lambda: phone, code_callback=code_callback, password=password_callback)
+            logger.info("Successfully logged in to Telegram")
+        except PhoneCodeInvalidError:
+            logger.error("Invalid Telegram verification code")
+            raise
+        except SessionPasswordNeededError:
+            logger.error("2FA password required but not provided or incorrect")
+            raise
+        except Exception as e:
+            logger.error(f"Error during Telegram login: {str(e)}")
+            raise
     
     def _setup_event_handlers(self):
         """Set up event handlers for capturing messages."""

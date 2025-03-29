@@ -312,8 +312,8 @@ class Coordinator:
                 # Update last report time
                 self.last_stats_report = current_time
                 
-                # Get parser stats
-                stats = self.message_parser.get_parser_stats()
+                # Get parser stats - now an async method
+                stats = await self.message_parser.get_parser_stats()
                 
                 # Log basic stats
                 logger.info(f"Parser statistics: processed={stats['total_processed']}, "

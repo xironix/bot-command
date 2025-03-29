@@ -14,6 +14,7 @@ from src.processing.stealer_plugins.stealc import StealCParser
 from src.processing.stealer_plugins.snake import SnakeStealerParser
 from src.processing.stealer_plugins.xworm import XWormParser
 from src.processing.stealer_plugins.vip import VIPStealerParser
+from src.processing.stealer_plugins.azorult import AzorultParser
 
 # Register all available plugins
 AVAILABLE_PLUGINS = [
@@ -24,7 +25,8 @@ AVAILABLE_PLUGINS = [
     StealCParser(),
     SnakeStealerParser(),
     XWormParser(),
-    VIPStealerParser()
+    VIPStealerParser(),
+    AzorultParser()
 ]
 
 __all__ = [
@@ -37,5 +39,6 @@ __all__ = [
     'StealCParser',
     'SnakeStealerParser',
     'XWormParser',
-    'VIPStealerParser'
+    'VIPStealerParser',
+    'AzorultParser'
 ]
