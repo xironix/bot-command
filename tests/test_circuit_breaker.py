@@ -4,8 +4,6 @@ Test the CircuitBreaker implementation.
 
 import unittest
 from datetime import datetime, timedelta
-from unittest.mock import patch, MagicMock
-import time
 
 from src.processing.worker_pool import CircuitBreaker
 

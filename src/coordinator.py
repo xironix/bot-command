@@ -9,7 +9,7 @@ import asyncio
 import logging
 import os
 from datetime import datetime
-from typing import Dict, List, Any, Optional
+from typing import Dict, List, Any
 
 from src.telegram.client import TelegramMonitor
 from src.processing.worker_pool import WorkerPool

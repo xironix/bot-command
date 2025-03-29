@@ -3,9 +3,8 @@ Test the JSON-first parsing approach in the MessageParser.
 """
 
 import unittest
-from unittest.mock import patch, MagicMock
+from unittest.mock import patch
 import json
-import os
 
 from src.processing.message_parser import MessageParser
 

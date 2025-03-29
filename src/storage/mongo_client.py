@@ -7,7 +7,7 @@ and retrieving intercepted data from stealer bots.
 
 import logging
 from datetime import datetime, timedelta
-from typing import Dict, List, Any, Optional, Union
+from typing import Dict, List, Any, Optional
 
 import motor.motor_asyncio
 from pymongo import MongoClient, IndexModel, ASCENDING, DESCENDING, HASHED, TEXT
@@ -90,13 +90,24 @@ class MongoDBManager:
                            name="logs_ttl")
             ])
             
-            # Bot token indexes
-            self.sync_db[self.config.bot_collection].create_indexes([
-                IndexModel([("token", ASCENDING)], unique=True),
-                IndexModel([("username", ASCENDING)], sparse=True),
-                IndexModel([("status", ASCENDING)]),
-                IndexModel([("last_checked", ASCENDING)]),
-                IndexModel([("failure_count", ASCENDING)])
+            # Handle bot collection indexes separately
+            bot_collection = self.sync_db[self.config.bot_collection]
+            
+            # Drop existing bot collection indexes (except _id)
+            try:
+                for index in bot_collection.list_indexes():
+                    if index['name'] != '_id_':
+                        bot_collection.drop_index(index['name'])
+            except PyMongoError as e:
+                logger.warning(f"Error dropping existing bot collection indexes: {str(e)}")
+            
+            # Create new bot collection indexes
+            bot_collection.create_indexes([
+                IndexModel([("token", ASCENDING)], unique=True, name="token_unique"),
+                IndexModel([("username", ASCENDING)], unique=True, name="username_unique"),
+                IndexModel([("status", ASCENDING)], name="status_index"),
+                IndexModel([("last_checked", ASCENDING)], name="last_checked_index"),
+                IndexModel([("failure_count", ASCENDING)], name="failure_count_index")
             ])
             
             logger.info("MongoDB indexes created successfully")
@@ -354,13 +365,14 @@ class MongoDBManager:
             logger.error(f"Failed to get credential stats: {str(e)}")
             raise
             
-    async def add_bot_token(self, token: str, username: Optional[str] = None) -> bool:
+    async def add_bot_token(self, token: str, username: str, status: str = 'active') -> bool:
         """
         Add a new bot token to monitor.
         
         Args:
             token: Bot token
-            username: Bot username (optional, can be fetched later)
+            username: Bot username
+            status: Bot status ('active', 'logged_out', 'invalid', 'unauthorized')
             
         Returns:
             bool: True if successful, False if token already exists
@@ -370,12 +382,12 @@ class MongoDBManager:
             await self.monitored_bots.insert_one({
                 "token": token,
                 "username": username,
-                "status": "active",
+                "status": status,
                 "added_at": now,
-                "last_checked": None,
-                "failure_count": 0,
-                "last_failure": None,
-                "last_success": None
+                "last_checked": now,
+                "failure_count": 0 if status == 'active' else 1,
+                "last_failure": now if status != 'active' else None,
+                "last_success": now if status == 'active' else None
             })
             return True
         except PyMongoError as e:

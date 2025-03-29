@@ -6,7 +6,6 @@ import unittest
 import os
 import tempfile
 import json
-from unittest.mock import patch, MagicMock
 from src.processing.message_parser import MessageParser
 from src.processing.stealer_plugins.base import StealerParserPlugin
 from src.processing.stealer_plugins import (

@@ -8,7 +8,7 @@ StealC has grown significantly in market share since 2023.
 import re
 import json
 import os
-from typing import Dict, List, Any, Tuple, Optional
+from typing import Dict, Any, Tuple
 from src.processing.stealer_plugins.base import StealerParserPlugin
 
 class StealCParser(StealerParserPlugin):

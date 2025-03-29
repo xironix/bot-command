@@ -5,14 +5,11 @@ This module implements a parser for the Azorult stealer format.
 """
 
 import re
-import json
-import os
 import logging
-from typing import Dict, List, Any, Tuple, Optional
+from typing import Dict, Any, Tuple
 from src.processing.stealer_plugins.base import StealerParserPlugin
 from src.processing.parser_utils import (
-    FlexiblePattern, PatternGroup, EnhancedFileHandler,
-    validate_credentials, validate_system_info, validate_cookies
+    FlexiblePattern, PatternGroup, EnhancedFileHandler
 )
 
 logger = logging.getLogger(__name__)
@@ -290,13 +287,19 @@ class AzorultParser(StealerParserPlugin):
 
             # Determine the number of potential credential sets
             num_creds = 0
-            if usernames: num_creds = len(usernames)
-            if passwords and len(passwords) > num_creds: num_creds = len(passwords)
+            if usernames:
+                num_creds = len(usernames)
+            if passwords and len(passwords) > num_creds:
+                num_creds = len(passwords)
             # Expand based on other primary fields if necessary
-            if urls and len(urls) > num_creds: num_creds = len(urls)
-            if domains and len(domains) > num_creds: num_creds = len(domains)
-            if hosts and len(hosts) > num_creds: num_creds = len(hosts)
-            if softwares and len(softwares) > num_creds: num_creds = len(softwares)
+            if urls and len(urls) > num_creds:
+                num_creds = len(urls)
+            if domains and len(domains) > num_creds:
+                num_creds = len(domains)
+            if hosts and len(hosts) > num_creds:
+                num_creds = len(hosts)
+            if softwares and len(softwares) > num_creds:
+                num_creds = len(softwares)
 
             for i in range(num_creds):
                 username = usernames[i] if i < len(usernames) else None
@@ -350,9 +353,12 @@ class AzorultParser(StealerParserPlugin):
             holders = card_matches.get('holder', [])
 
             num_cards = 0
-            if numbers: num_cards = len(numbers)
-            if expiries and len(expiries) > num_cards: num_cards = len(expiries)
-            if cvvs and len(cvvs) > num_cards: num_cards = len(cvvs)
+            if numbers:
+                num_cards = len(numbers)
+            if expiries and len(expiries) > num_cards:
+                num_cards = len(expiries)
+            if cvvs and len(cvvs) > num_cards:
+                num_cards = len(cvvs)
 
             for i in range(num_cards):
                 number = numbers[i] if i < len(numbers) else None

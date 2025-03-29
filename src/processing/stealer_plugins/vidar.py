@@ -8,7 +8,7 @@ Vidar is a veteran stealer active since 2018, known for targeting financial data
 import re
 import json
 import os
-from typing import Dict, List, Any, Tuple, Optional
+from typing import Dict, Any, Tuple
 from src.processing.stealer_plugins.base import StealerParserPlugin
 
 class VidarParser(StealerParserPlugin):

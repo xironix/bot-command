@@ -6,10 +6,7 @@ This tool silently intercepts and replicates the data collection process of
 Telegram-based stealer bots without modifying their behavior or alerting operators.
 """
 
-# Load environment variables FIRST, before any other project imports
-from dotenv import load_dotenv
-load_dotenv()
-
+# Standard library imports first
 import asyncio
 import argparse
 import logging
@@ -18,9 +15,16 @@ import signal
 import sys
 from datetime import datetime
 from logging.handlers import RotatingFileHandler
+from rich.logging import RichHandler
 
-# Now import project modules AFTER dotenv is loaded
+# Third-party imports
+from dotenv import load_dotenv
+
+# Local application/library specific imports
 from src.coordinator import Coordinator
+
+# Load environment variables AFTER imports but BEFORE using them
+load_dotenv()
 
 # Create logs directory if it doesn't exist
 os.makedirs("logs", exist_ok=True)
@@ -38,15 +42,32 @@ file_handler = RotatingFileHandler(
     encoding="utf-8"
 )
 
-# Configure logging
+# Set formatter for the file handler (optional but good practice)
+file_formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+file_handler.setFormatter(file_formatter)
+
+# Configure basic logging (without handlers initially)
+# Remove format, as RichHandler handles console format
+# Remove handlers, as we'll add them manually
 logging.basicConfig(
     level=log_level,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.StreamHandler(sys.stdout),
-        file_handler
-    ]
+    handlers=[] # Start with no handlers here
 )
+
+# Create RichHandler for console output
+rich_handler = RichHandler(
+    level=log_level, # Set level for this handler
+    show_time=True,
+    show_level=True,
+    show_path=False, # Don't show path by default, can be noisy
+    markup=True, # Enable Rich markup in log messages
+    rich_tracebacks=True # Enable rich tracebacks
+)
+
+# Add handlers to the root logger
+root_logger = logging.getLogger()
+root_logger.addHandler(rich_handler) # Add colorful console handler
+root_logger.addHandler(file_handler) # Add rotating file handler
 
 # Set specific log levels for noisy libraries
 logging.getLogger("telethon").setLevel(logging.WARNING)

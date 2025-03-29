@@ -7,10 +7,13 @@ SnakeStealer is a .NET-based stealer with advanced anti-VM capabilities.
 
 import re
 import json
-import base64
 import os
-from typing import Dict, List, Any, Tuple, Optional
+from typing import Dict, Any, Tuple
 from src.processing.stealer_plugins.base import StealerParserPlugin
+import logging
+import binascii
+
+logger = logging.getLogger(__name__)
 
 class SnakeStealerParser(StealerParserPlugin):
     """Parser for SnakeStealer output."""
@@ -191,9 +194,14 @@ class SnakeStealerParser(StealerParserPlugin):
                     except json.JSONDecodeError:
                         # Failed to parse as JSON, continue with regex
                         pass
-            except:
-                # If JSON parsing fails, fall back to regex extraction
-                pass
+                    except Exception as e:
+                         # Log other unexpected errors during JSON parsing
+                         logger.warning(f"Unexpected error parsing initial JSON block in Snake parser: {e}")
+                         pass # Fallback to regex
+            except Exception as e:
+                # Catch errors during the initial JSON search/extraction logic
+                logger.warning(f"Error during initial JSON block search/extraction in Snake parser: {e}")
+                pass # Fallback to regex extraction
                 
         # Extract credentials using regex
         for pattern in self._patterns["credentials"]:
@@ -238,8 +246,13 @@ class SnakeStealerParser(StealerParserPlugin):
                     try:
                         software_json = match.group(1)
                         system_info["installed_software"] = software_json
-                    except:
-                        pass
+                    except IndexError:
+                         # Expected if regex group doesn't exist
+                         pass
+                    except Exception as e:
+                         # Log unexpected errors getting the regex group
+                         logger.warning(f"Unexpected error getting software_json regex group in Snake parser: {e}")
+                         pass # Ignore if we can't get this specific info
                 elif "isVirtualMachine" in pattern.pattern:
                     system_info["is_virtual_machine"] = match.group(1).lower() == "true"
                 elif "isDomainJoined" in pattern.pattern:
@@ -309,12 +322,20 @@ class SnakeStealerParser(StealerParserPlugin):
                         # Merge system info (dictionary)
                         if embedded_result.get("system_info"):
                             result["system_info"].update(embedded_result["system_info"])
-                    except:
-                        # Not valid JSON, ignore
+                    except json.JSONDecodeError:
+                        # Expected if the decoded string is not valid JSON
                         pass
-            except:
-                # Failed to decode, ignore
+                    except Exception as e:
+                        # Log other unexpected errors during embedded JSON parsing
+                        logger.warning(f"Unexpected error processing embedded JSON in decoded base64 block (Snake): {e}")
+                        pass # Ignore if we can't process the embedded JSON
+            except binascii.Error:
+                # Expected error if base64 decoding fails
                 pass
+            except Exception as e:
+                # Log other unexpected errors during base64 decoding
+                logger.warning(f"Unexpected error decoding base64 block in Snake parser: {e}")
+                pass # Ignore if decoding fails unexpectedly
                 
         # Parse attachments if available
         if message_data.get("has_media") and message_data.get("media_path"):

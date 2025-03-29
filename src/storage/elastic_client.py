@@ -5,14 +5,13 @@ This module handles the connection to Elasticsearch and provides methods for
 storing, retrieving, and analyzing intercepted data.
 """
 
-import json
 import logging
 import os  # Import os module
 from datetime import datetime, timedelta
-from typing import Dict, List, Any, Optional
+from typing import Dict, List, Any
 from urllib.parse import urlparse # Added import
 
-from elasticsearch import AsyncElasticsearch, NotFoundError
+from elasticsearch import AsyncElasticsearch
 from elasticsearch.helpers import async_bulk
 
 from config.settings import config

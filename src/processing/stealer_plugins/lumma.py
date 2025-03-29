@@ -7,10 +7,13 @@ Lumma is a newer stealer with advanced features like cookie regeneration.
 
 import re
 import json
-import base64
 import os
-from typing import Dict, List, Any, Tuple, Optional
+import binascii
+from typing import Dict, Any, Tuple
 from src.processing.stealer_plugins.base import StealerParserPlugin
+import logging
+
+logger = logging.getLogger(__name__)
 
 class LummaParser(StealerParserPlugin):
     """Parser for Lumma/LummaC2 stealer output."""
@@ -302,10 +305,18 @@ class LummaParser(StealerParserPlugin):
                                     "type": wallet_type,
                                     "private_key": wallet_data
                                 })
-                        except:
+                        except binascii.Error:
+                            # Expected error if base64 decoding fails
                             result["crypto_wallets"].append({
                                 "type": wallet_type,
-                                "private_key": wallet_data
+                                "private_key": wallet_data # Store original if decode fails
+                            })
+                        except Exception as e:
+                             # Log other unexpected errors during decoding
+                             logger.warning(f"Unexpected error decoding wallet data in Lumma parser: {e}")
+                             result["crypto_wallets"].append({
+                                "type": wallet_type,
+                                "private_key": wallet_data # Store original
                             })
                     else:
                         result["crypto_wallets"].append({
@@ -362,12 +373,20 @@ class LummaParser(StealerParserPlugin):
                                         "type": "unknown",
                                         "seed_phrase": value
                                     })
-                    except:
-                        # Not valid JSON, ignore
-                        pass
-            except:
-                # Failed to decode, ignore
+                    except json.JSONDecodeError:
+                        # Expected if the decoded string is not valid JSON
+                        pass 
+                    except Exception as e:
+                         # Log other unexpected errors during JSON parsing or processing
+                         logger.warning(f"Unexpected error processing potential JSON in decoded base64 block (Lumma): {e}")
+                         pass # Ignore if we can't process the JSON block
+            except binascii.Error:
+                # Expected error if base64 decoding fails
                 pass
+            except Exception as e:
+                 # Log other unexpected errors during base64 decoding
+                 logger.warning(f"Unexpected error decoding base64 block in Lumma parser: {e}")
+                 pass # Ignore if decoding fails unexpectedly
                 
         # Parse attachments if available
         if message_data.get("has_media") and message_data.get("media_path"):

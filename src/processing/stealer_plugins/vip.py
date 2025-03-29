@@ -4,7 +4,7 @@ VIP Stealer parser plugin.
 This module implements a parser for the VIP Stealer format targeting high-net-worth marks.
 """
 
-from typing import Dict, List, Any, Tuple
+from typing import Dict, Any, Tuple
 from src.processing.stealer_plugins.base import StealerParserPlugin
 
 class VIPStealerParser(StealerParserPlugin):

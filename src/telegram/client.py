@@ -9,31 +9,35 @@ import asyncio
 import logging
 import os
 import shutil
+import binascii # Needed for base64 errors during download
 from datetime import datetime, timedelta
-from typing import Dict, List, Callable, Any, Optional, Union, Set
+from typing import Dict, Callable, Any, Optional, Union, Coroutine
 
-from telethon import TelegramClient, events
+from telethon import TelegramClient, events, errors
 from telethon.tl import types
-from telethon.errors import SessionPasswordNeededError, PhoneCodeInvalidError
+from telethon.sessions import StringSession # Can use StringSession if needed, file default is fine
 
 from config.settings import config
+from src.storage.mongo_client import MongoDBManager
 
 logger = logging.getLogger(__name__)
 
 class TelegramMonitor:
-    """Silent monitor for Telegram bots."""
+    """Monitors Telegram bots by polling updates for each bot token."""
     
-    def __init__(self, message_handler: Callable[[Dict[str, Any]], None]):
+    def __init__(self, message_handler: Callable[[Dict[str, Any]], Coroutine]):
         """
         Initialize Telegram monitor.
         
         Args:
-            message_handler: Callback function to handle intercepted messages
+            message_handler: Async callback function to handle intercepted messages
         """
         self.config = config.telegram
-        self.message_handler = message_handler
-        self.clients = {}  # Store multiple clients for different bots
-        self._main_client = None  # Main user client for monitoring
+        self._message_handler = message_handler
+        self.bot_clients: Dict[str, TelegramClient] = {} # token -> client
+        self.polling_tasks: Dict[str, asyncio.Task] = {} # token -> task
+        self.mongo = MongoDBManager()
+        self._shutdown_event = asyncio.Event() # Event to signal shutdown
         
         # Media file management
         self.downloads_dir = os.path.abspath("downloads")
@@ -45,225 +49,301 @@ class TelegramMonitor:
         os.makedirs(self.downloads_dir, exist_ok=True)
         
     async def initialize(self):
-        """Initialize Telegram clients and connections."""
-        # Set up main user client for monitoring bot messages
-        self._main_client = TelegramClient(
-            self.config.session_name,
-            self.config.api_id,
-            self.config.api_hash
-        )
+        """Initialize Telegram clients and connections for active bots."""
+        logger.info("Initializing Telegram Monitor...")
+        self._shutdown_event.clear() # Ensure shutdown event is not set
         
         try:
-            # Try to start client using session file (non-interactive login)
-            await self._main_client.connect()
+            # Get active bot tokens from MongoDB
+            active_tokens = await self.mongo.get_active_bot_tokens()
+            if not active_tokens:
+                logger.warning("No active bot tokens found in database. Monitor will not start any clients.")
+                return
             
-            # Check if session is valid
-            if not await self._main_client.is_user_authorized():
-                logger.info("Existing session not valid, attempting to login")
-                await self._automated_login()
+            logger.info(f"Found {len(active_tokens)} active bot tokens. Initializing clients...")
+            
+            init_tasks = []
+            for token in active_tokens:
+                # Create a task for each bot initialization
+                init_tasks.append(asyncio.create_task(self._initialize_bot_client(token)))
+            
+            # Wait for all initialization tasks to complete
+            results = await asyncio.gather(*init_tasks, return_exceptions=True)
+            
+            successful_inits = 0
+            for i, result in enumerate(results):
+                token = active_tokens[i]
+                if isinstance(result, Exception):
+                    logger.error(f"Failed to initialize client for token {token[:10]}...: {result}")
+                elif result: # _initialize_bot_client returns True on success
+                    successful_inits += 1
+                # else: _initialize_bot_client returned False (e.g., connection failed)
+            
+            if successful_inits == 0 and active_tokens:
+                 logger.error("Failed to initialize any bot clients. Telegram monitoring will not function.")
+                 # Decide if we should raise an error here or just log
+                 # raise RuntimeError("Failed to initialize any Telegram bot clients.")
             else:
-                logger.info("Successfully authenticated using existing session")
-                
+                 logger.info(f"Successfully initialized {successful_inits}/{len(active_tokens)} bot clients.")
+            
+            # Schedule cleanup tasks (only if any clients initialized)
+            if successful_inits > 0:
+                asyncio.create_task(self._schedule_media_cleanup())
+                # Clean up any leftover files from previous runs
+                await self._cleanup_old_downloads()
+            
+            logger.info("Telegram monitor initialization complete.")
+            
         except Exception as e:
-            logger.error(f"Error during Telegram client initialization: {str(e)}")
-            raise
-            
-        logger.info("Main Telegram client initialized")
+            logger.error(f"Critical error during Telegram client initialization process: {str(e)}", exc_info=True)
+            await self.close() # Attempt graceful shutdown on critical init failure
+            raise # Re-raise the exception
         
-        # Set up event handlers
-        self._setup_event_handlers()
-        
-        # Schedule cleanup tasks
-        asyncio.create_task(self._schedule_media_cleanup())
-        
-        # Clean up any leftover files from previous runs
-        await self._cleanup_old_downloads()
-        
-        # Get information about the bots from their tokens
-        if self.config.bot_tokens:
-            await self._retrieve_bot_info_from_tokens()
-        
-    async def _automated_login(self):
-        """Attempt to log in without user interaction using environment variables."""
-        if not self.config.phone_number:
-            logger.error("Phone number is required for Telegram login but not provided in config")
-            raise ValueError("Phone number is required for Telegram login")
-            
-        phone = self.config.phone_number
-        logger.info(f"Attempting automated login for phone {phone}")
-            
-        # Define callback functions that will retrieve values from environment variables
-        async def code_callback():
-            code = os.getenv("TELEGRAM_CODE")
-            if not code:
-                logger.error("TELEGRAM_CODE environment variable not set for authentication")
-                raise ValueError("TELEGRAM_CODE environment variable not set")
-            return code
-            
-        async def password_callback():
-            password = os.getenv("TELEGRAM_2FA_PASSWORD")
-            if not password:
-                logger.error("TELEGRAM_2FA_PASSWORD environment variable not set for 2FA")
-                raise ValueError("TELEGRAM_2FA_PASSWORD environment variable not set")
-            return password
-            
+    async def _initialize_bot_client(self, token: str) -> bool:
+        """Initializes and starts polling for a single bot token."""
+        session_name = f"bot_{token[:10]}"
+        logger.debug(f"Initializing client for token {token[:10]}... (Session: {session_name})")
+        client: Optional[TelegramClient] = None # Explicitly type hint
         try:
-            # Start the client with the callbacks
-            await self._main_client.start(phone=lambda: phone, code_callback=code_callback, password=password_callback)
-            logger.info("Successfully logged in to Telegram")
-        except PhoneCodeInvalidError:
-            logger.error("Invalid Telegram verification code")
-            raise
-        except SessionPasswordNeededError:
-            logger.error("2FA password required but not provided or incorrect")
-            raise
-        except Exception as e:
-            logger.error(f"Error during Telegram login: {str(e)}")
-            raise
-    
-    def _setup_event_handlers(self):
-        """Set up event handlers for capturing messages."""
-        
-        # Monitor messages from bots that we're tracking
-        @self._main_client.on(events.NewMessage)
-        async def message_handler(event):
-            # Check if the message is from a bot we're interested in
-            if hasattr(event.message.peer_id, 'user_id'):
-                sender = await self._main_client.get_entity(event.message.peer_id)
-                
-                # Process if it's a bot and we're tracking it
-                if sender.bot and sender.username:
-                    # Check if this bot is in our monitoring list
-                    # This could be enhanced to check against a database of tracked bots
-                    if await self._should_process_bot(sender.username):
-                        await self._process_message(event.message, sender)
-                        
-    async def _should_process_bot(self, username: str) -> bool:
-        """
-        Determine if a bot should be processed.
-        
-        Args:
-            username: Bot's username
+            client = TelegramClient(
+                session_name,
+                self.config.api_id,
+                self.config.api_hash,
+            )
             
-        Returns:
-            True if the bot should be processed, False otherwise
-        """
-        try:
-            # Check blocklist first - if bot is blocklisted, never process it
-            if username in self.config.bot_blocklist:
-                logger.debug(f"Bot {username} is in blocklist, ignoring")
-                return False
-                
-            # Check explicit allowlist
-            if username in self.config.bot_usernames:
-                logger.debug(f"Bot {username} is in allowlist, processing")
-                return True
-                
-            # Check if bot token matches
-            if username in self.config.bot_tokens:
-                logger.debug(f"Bot {username} matches a configured token, processing")
-                return True
-                
-            # If monitor_all_bots is enabled, process everything not blocklisted
-            if self.config.monitor_all_bots:
-                logger.debug(f"Processing bot {username} (monitor_all_bots=True)")
-                return True
-                
-            # If filtering by patterns is enabled, check patterns
-            if self.config.filter_by_patterns:
-                # Check for known stealer bot patterns
-                stealer_patterns = [
-                    # Common stealer bot naming patterns
-                    r"steal(er)?bot",
-                    r"info(rmation)?collect(or)?",
-                    r"data(collect(or)?|grab(ber)?)",
-                    r"cred(ential)?s?(grab(ber)?|collect(or)?)",
-                    r"log(ger|collect(or)?)",
-                    r"(cookie|cred)s?dump(er)?",
-                    r"exfil(trat(e|or|ion))?",
-                    r"grab(ber)?bot",
-                    r"harvest(er)?bot",
-                    r"redline(steal(er)?)?",
-                    r"raccoon(steal(er)?)?",
-                    r"vidar(steal(er)?)?",
-                    r"azorult",
-                    r"loki(steal(er)?)?",
-                    r"taurus(steal(er)?)?",
-                    r"(meteor|meta)steal(er)?",
-                    r"blackguard",
-                    r"mars(steal(er)?)?",
-                    r"titan(steal(er)?)?",
-                    r"aurora(steal(er)?)?",
-                ]
-                
-                # Check if username matches any pattern
-                import re
-                for pattern in stealer_patterns:
-                    if re.search(pattern, username, re.IGNORECASE):
-                        logger.info(f"Bot {username} matched stealer pattern {pattern}")
-                        return True
+            await client.connect()
             
-            # Check database of known stealer bots (not implemented in this version)
-            try:
-                # This would be implemented by querying MongoDB in a real-world scenario
-                # if await self._check_bot_in_database(username):
-                #     logger.info(f"Bot {username} found in database of known stealer bots")
-                #     return True
-                pass
-            except Exception as e:
-                logger.error(f"Error checking bot database: {str(e)}")
-            
-            # If we reach here, bot didn't match any criteria
-            logger.debug(f"Bot {username} did not match any monitoring criteria, ignoring")
+            if not await client.is_user_authorized():
+                 logger.info(f"Attempting to sign in with bot token {token[:10]}...")
+                 try:
+                      await client.sign_in(bot_token=token)
+                      logger.info(f"Successfully signed in with bot token {token[:10]}.")
+                 except errors.AuthKeyError:
+                      logger.error(f"Authentication failed for token {token[:10]}...: Invalid token or token revoked.")
+                      await client.disconnect()
+                      return False
+                 except errors.ApiIdInvalidError:
+                      logger.error(f"Authentication failed for token {token[:10]}...: Invalid api_id/api_hash.")
+                      await client.disconnect()
+                      # This is a fatal config error, maybe raise?
+                      return False
+                 except Exception as auth_err:
+                      logger.error(f"Unexpected error signing in with token {token[:10]}...: {auth_err}", exc_info=True)
+                      await client.disconnect()
+                      return False
+            else:
+                 logger.info(f"Client for token {token[:10]}... is already authorized.")
+                 me = await client.get_me() # me can be User or None
+
+                 # Explicitly check if me is None first
+                 if me is None:
+                      logger.warning(f"Client for token {token[:10]}... get_me() returned None after authorization.")
+                 elif isinstance(me, types.User):
+                      # Now we know me is a User, access attributes safely
+                      if not me.bot:
+                           logger.warning(f"Client for token {token[:10]}... authorized but not as a bot? Type: {type(me)}")
+                      elif me.id != int(token.split(':')[0]):
+                           logger.warning(f"Client for token {token[:10]}... authorized as wrong bot ID ({me.id})? Session conflict?")
+                      else:
+                           logger.debug(f"Verified authorization for bot {me.username} ({me.id})")
+                 else:
+                      # Handle unexpected types returned by get_me()
+                      logger.warning(f"Client for token {token[:10]}... get_me() returned unexpected type: {type(me)}")
+
+            self.bot_clients[token] = client
+            task = asyncio.create_task(self._poll_updates(token, client))
+            self.polling_tasks[token] = task
+            logger.info(f"Started polling updates for bot token {token[:10]}...")
+            return True
+
+        except errors.FloodWaitError as e:
+            logger.error(f"Flood wait error initializing client for token {token[:10]}...: Waiting {e.seconds}s")
+            await asyncio.sleep(e.seconds + 5)
+            # Check client is not None before accessing methods
+            if client and client.is_connected(): await client.disconnect()
             return False
-            
+        except ConnectionError as e:
+            logger.error(f"Connection error initializing client for token {token[:10]}...: {e}")
+            if client and client.is_connected(): await client.disconnect()
+            return False
         except Exception as e:
-            logger.error(f"Error in bot filtering for {username}: {str(e)}")
-            # Default to safe behavior - don't process if we can't determine
+            logger.error(f"Unexpected error initializing client for token {token[:10]}...: {str(e)}", exc_info=True)
+            if client and client.is_connected():
+                await client.disconnect()
             return False
         
-    async def _process_message(self, message: types.Message, sender: types.User):
-        """
-        Process a message from a bot.
-        
-        Args:
-            message: Telegram message
-            sender: Message sender
-        """
-        # Extract relevant data from the message
-        data = {
-            "bot_id": sender.id,
-            "bot_username": sender.username,
-            "message_id": message.id,
-            "timestamp": datetime.utcnow(),
-            "text": message.text if message.text else "",
-            "has_media": message.media is not None,
-            "media_type": type(message.media).__name__ if message.media else None,
-            "raw_message": message.to_dict()  # Store full message for advanced processing
-        }
-        
-        # If media is present, download it
-        if message.media:
+    async def _poll_updates(self, token: str, client: TelegramClient):
+        """Continuously poll for updates for a specific bot client."""
+        bot_info: Optional[Dict] = None # Type hint
+        retries = 0
+        max_retries = 5
+        retry_delay = 5 # seconds
+
+        while not self._shutdown_event.is_set():
             try:
-                # Download and store media
-                media_path = await self._download_media(message)
-                if media_path:
-                    data["media_path"] = media_path
+                if not client.is_connected():
+                    logger.warning(f"Client for token {token[:10]}... disconnected. Attempting reconnect...")
+                    await client.connect()
+                    if not await client.is_user_authorized():
+                         logger.warning(f"Client for {token[:10]}... requires re-authentication after reconnect.")
+                         # Attempt re-auth or handle appropriately, maybe stop polling?
+                         await client.sign_in(bot_token=token) # May raise errors
+                    logger.info(f"Client for token {token[:10]}... reconnected.")
+
+                # Get bot info once
+                if bot_info is None:
+                    me = await client.get_me()
+                    # Ensure me is a User and is a bot before setting bot_info
+                    if isinstance(me, types.User) and me.bot:
+                        bot_info = {"id": me.id, "username": me.username}
+                        logger.debug(f"Polling as bot: {bot_info['username']} ({bot_info['id']})")
+                    else:
+                        logger.error(f"Failed to get bot identity (or not a bot) for token {token[:10]}... Stopping poll. Got: {type(me)}")
+                        break # Stop polling if we can't identify the bot
+
+                # Use iter_messages with entity='me' to poll for incoming messages to the bot itself
+                logger.debug(f"Polling for messages for bot {bot_info['username']}...")
+                async for message in client.iter_messages('me', limit=10, wait_time=60):
+                    if self._shutdown_event.is_set(): break
+
+                    logger.info(f"Received message (ID: {message.id}) for bot {bot_info['username']}")
+                    asyncio.create_task(self._process_incoming_message(token, client, message, bot_info))
+
+                retries = 0
+
+            except errors.AuthKeyError:
+                logger.error(f"Authentication key error for bot token {token[:10]}... Token likely revoked. Stopping poll.")
+                await self.mongo.update_bot_status(token=token, status="inactive")
+                break
+            except errors.UserDeactivatedError:
+                 logger.error(f"Bot account for token {token[:10]}... is deactivated. Stopping poll.")
+                 await self.mongo.update_bot_status(token=token, status="inactive")
+                 break
+            except errors.RPCError as e:
+                 logger.error(f"Telegram RPC Error for bot {bot_info['username'] if bot_info else token[:10]}: {e}")
+                 if retries < max_retries:
+                      retries += 1
+                      logger.warning(f"Retrying poll for {bot_info['username'] if bot_info else token[:10]} in {retry_delay}s (Attempt {retries}/{max_retries})")
+                      await asyncio.sleep(retry_delay)
+                 else:
+                      logger.error(f"Max retries reached for bot {bot_info['username'] if bot_info else token[:10]}. Stopping poll.")
+                      await self.mongo.update_bot_status(token=token, status="error")
+                      break
+            except asyncio.CancelledError:
+                 logger.info(f"Polling task for bot {bot_info['username'] if bot_info else token[:10]} cancelled.")
+                 break
             except Exception as e:
-                logger.error(f"Failed to download media: {str(e)}")
-                
-        # Pass to handler
-        self.message_handler(data)
+                logger.error(f"Unexpected error in polling loop for bot {bot_info['username'] if bot_info else token[:10]}: {str(e)}", exc_info=True)
+                if retries < max_retries:
+                      retries += 1
+                      logger.warning(f"Retrying poll for {bot_info['username'] if bot_info else token[:10]} in {retry_delay * 2}s (Attempt {retries}/{max_retries})")
+                      await asyncio.sleep(retry_delay * 2)
+                else:
+                      logger.error(f"Max retries reached for bot {bot_info['username'] if bot_info else token[:10]} after unexpected error. Stopping poll.")
+                      await self.mongo.update_bot_status(token=token, status="error")
+                      break
+
+        logger.info(f"Polling stopped for bot token {token[:10]}...")
+        # Ensure client is removed if polling stops
+        if token in self.bot_clients:
+            del self.bot_clients[token]
+        if token in self.polling_tasks:
+             del self.polling_tasks[token]
+        if client.is_connected():
+            await client.disconnect()
         
-    async def _download_media(self, message: types.Message) -> Optional[str]:
+    async def _process_incoming_message(self, token: str, client: TelegramClient, message: types.Message, bot_info: Dict):
+        """Process a message received by a specific bot."""
+        try:
+            sender_info = {}
+            sender_entity = None
+            # Use getattr for safer access to from_id (often more reliable than sender_id)
+            from_id = getattr(message, 'from_id', None)
+
+            # Check if from_id exists before trying to get the entity
+            if from_id:
+                try:
+                     # Use get_entity which handles various peer types
+                     # Note: get_entity works with Peer objects, from_id should be a Peer type
+                     sender_entity = await client.get_entity(from_id)
+                     if isinstance(sender_entity, types.User):
+                          sender_info = {
+                               "id": sender_entity.id,
+                               "username": sender_entity.username,
+                               "first_name": sender_entity.first_name,
+                               "last_name": sender_entity.last_name,
+                               "is_bot": sender_entity.bot,
+                               "is_premium": sender_entity.premium
+                          }
+                     # Check for Channel (supergroups/channels) which have usernames
+                     elif isinstance(sender_entity, types.Channel):
+                           sender_info = {
+                                "id": sender_entity.id,
+                                "title": sender_entity.title,
+                                "username": sender_entity.username, # Channels have usernames
+                                "type": type(sender_entity).__name__
+                           }
+                     # Check for Chat (small groups) which do *not* have usernames
+                     elif isinstance(sender_entity, types.Chat):
+                          sender_info = {
+                               "id": sender_entity.id,
+                               "title": sender_entity.title,
+                               # No username for basic Chat type
+                               "type": type(sender_entity).__name__
+                          }
+                except ValueError:
+                     # This might happen if from_id is None or refers to an inaccessible peer
+                     logger.warning(f"Could not get entity for from_id: {from_id}")
+                except Exception as e:
+                     logger.error(f"Error getting sender entity for from_id {from_id}: {e}")
+            # If from_id was None or couldn't be resolved, sender_info remains {}
+
+            msg_date = getattr(message, 'date', None)
+
+            # Extract relevant data from the message, using getattr for safety
+            data = {
+                "bot_id": bot_info["id"],
+                "bot_username": bot_info["username"],
+                "message_id": message.id,
+                "chat_id": getattr(message, 'chat_id', None),
+                "sender": sender_info,
+                "timestamp": msg_date.replace(tzinfo=None) if msg_date else None,
+                "text": getattr(message, 'text', ""),
+                "has_media": message.media is not None,
+                "media_type": type(message.media).__name__ if message.media else None,
+                "raw_message": message.to_dict()
+            }
+
+            # If media is present, download it using the correct client
+            if message.media:
+                try:
+                    media_path = await self._download_media(client, message) # Pass the client instance
+                    if media_path:
+                        data["media_path"] = media_path
+                    else:
+                         # Update data if download failed but media exists
+                         data["media_download_failed"] = True
+                except Exception as e:
+                    logger.error(f"Failed processing media for message {message.id}: {str(e)}", exc_info=True)
+                    data["media_download_failed"] = True
+                    data["media_download_error"] = str(e)
+
+            # Pass to the coordinator's handler
+            await self._message_handler(data)
+
+        except Exception as e:
+            logger.error(f"Failed to process incoming message {getattr(message, 'id', 'UNKNOWN')} for bot {bot_info['username']}: {str(e)}", exc_info=True)
+        
+    async def _download_media(self, client: TelegramClient, message: types.Message) -> Optional[str]:
         """
-        Download media from a message.
+        Download media from a message using the specific bot's client.
         
         Args:
-            message: Telegram message with media
+            client: The TelegramClient instance associated with the bot.
+            message: Telegram message with media.
             
         Returns:
-            Path to the downloaded media or None if download failed
+            Path to the downloaded media or None if download failed.
         """
         try:
             # Check available disk space before download
@@ -276,209 +356,180 @@ class TelegramMonitor:
                     logger.error("Insufficient disk space even after cleanup, skipping download")
                     return None
             
-            # Generate a unique filename
-            timestamp = datetime.utcnow().strftime('%Y%m%d%H%M%S')
-            filename = f"{self.downloads_dir}/{message.id}_{timestamp}"
+            # Generate a unique filename based on bot_id and message_id
+            # Await get_me() before accessing its attributes
+            me = await client.get_me()
+            if not me or not hasattr(me, 'id'): # Ensure me and me.id exist
+                 logger.error(f"Could not determine client bot ID for download. Client: {client}")
+                 return None
+            bot_id = me.id
+
+            timestamp = datetime.utcnow().strftime('%Y%m%d%H%M%S%f')
+            filename_base = f"bot{bot_id}_msg{message.id}_{timestamp}"
+            filepath_base = os.path.join(self.downloads_dir, filename_base)
             
             # Download the media
-            path = await self._main_client.download_media(message, filename)
-            
-            if path:
-                # Add to tracked downloads for cleanup
+            path = await client.download_media(message, filepath_base)
+
+            # Ensure path is a string and exists before returning
+            if path and isinstance(path, str) and os.path.exists(path):
                 self.tracked_downloads.add(path)
-                logger.debug(f"Downloaded media to {path}")
-            
-            return path
+                logger.debug(f"Downloaded media to {path} using bot {bot_id}")
+                return path
+            elif path:
+                 # Log if path was returned but wasn't a valid string or didn't exist
+                 logger.warning(f"Download for msg {message.id} by bot {bot_id} returned path '{path}' (type: {type(path)}), but it's invalid or non-existent.")
+                 return None
+            else:
+                 logger.warning(f"Download initiated for message {message.id} by bot {bot_id} but path was None.")
+                 return None
+        except errors.FileReferenceExpiredError:
+             logger.warning(f"File reference expired for media in message {message.id}. Cannot download.")
+             # Maybe try to refetch the message? For now, just return None.
+             return None
+        except (binascii.Error, TypeError) as b64_err:
+             # Catch potential errors during download related to base64 decoding (rare)
+             logger.error(f"Base64 related error downloading media for message {message.id}: {b64_err}")
+             return None
         except Exception as e:
-            logger.error(f"Failed to download media: {str(e)}")
+            logger.error(f"Failed to download media for message {message.id}: {str(e)}", exc_info=True)
             return None
-            
-    async def monitor_bot_channel(self, channel_id: Union[int, str]):
-        """
-        Monitor a specific bot channel.
         
-        Args:
-            channel_id: ID or username of the channel to monitor
-        """
-        try:
-            # Get the channel entity
-            channel = await self._main_client.get_entity(channel_id)
-            logger.info(f"Started monitoring channel: {channel.title}")
-            
-            # We don't need to do anything more here since our event handlers
-            # will catch any new messages
-        except Exception as e:
-            logger.error(f"Failed to monitor channel {channel_id}: {str(e)}")
-            
     def _check_disk_space(self) -> bool:
-        """
-        Check if available disk space is above threshold.
-        
-        Returns:
-            True if enough space is available, False otherwise
-        """
+        """Check if disk usage is within limits."""
         try:
-            # Get disk usage of downloads directory
             total, used, free = shutil.disk_usage(self.downloads_dir)
-            
-            # Convert to GB
-            used_gb = used / (1024 ** 3)
-            total_gb = total / (1024 ** 3)
-            
-            # Log current usage
-            logger.debug(f"Current disk usage: {used_gb:.2f}GB of {total_gb:.2f}GB")
-            
-            # Check if we're under the threshold
-            return used_gb < self.max_disk_usage_gb
+            used_gb = used / (1024**3)
+            if used_gb > self.max_disk_usage_gb:
+                logger.warning(f"Disk usage ({used_gb:.2f} GB) exceeds limit ({self.max_disk_usage_gb} GB)")
+                return False
+            return True
         except Exception as e:
             logger.error(f"Error checking disk space: {str(e)}")
-            # Assume there's enough space if we can't check
-            return True
-            
+            return True # Default to true if check fails to avoid blocking downloads
+        
     async def _cleanup_old_downloads(self, force: bool = False):
-        """
-        Clean up old downloaded media files.
-        
-        Args:
-            force: If True, be more aggressive in cleanup
-        """
+        """Remove old downloaded media files."""
+        logger.info(f"Running media cleanup. Retention: {self.media_retention_days} days. Force: {force}")
+        now = datetime.utcnow()
+        cutoff = now - timedelta(days=self.media_retention_days)
+        cleaned_count = 0
+        cleaned_size = 0
+
+        # Also clean up self.tracked_downloads list for files that no longer exist
+        missing_files = set()
+
+        # Use a copy of the set for iteration as we might modify it
+        current_tracked = list(self.tracked_downloads)
+
+        for file_path in current_tracked:
+             try:
+                  if not os.path.exists(file_path):
+                       missing_files.add(file_path)
+                       continue
+
+                  # Get file modification time (UTC)
+                  mod_time_ts = os.path.getmtime(file_path)
+                  mod_time = datetime.utcfromtimestamp(mod_time_ts)
+
+                  if mod_time < cutoff or force:
+                       file_size = os.path.getsize(file_path)
+                       os.remove(file_path)
+                       logger.debug(f"Deleted old media file: {file_path} (Modified: {mod_time})")
+                       self.tracked_downloads.discard(file_path) # Remove from tracking
+                       cleaned_count += 1
+                       cleaned_size += file_size
+
+             except FileNotFoundError:
+                  missing_files.add(file_path) # Already gone
+             except Exception as e:
+                  logger.error(f"Error deleting media file {file_path}: {str(e)}")
+
+        # Clean up tracked set
+        if missing_files:
+             logger.debug(f"Removing {len(missing_files)} non-existent files from tracked downloads.")
+             self.tracked_downloads.difference_update(missing_files)
+
+        # Also scan directory for untracked old files (e.g., from crashes)
+        logger.debug(f"Scanning {self.downloads_dir} for any untracked old files...")
         try:
-            logger.info(f"Cleaning up old downloaded media files{' (forced)' if force else ''}")
-            
-            # Get current time
-            now = datetime.utcnow()
-            
-            # Adjust retention period for forced cleanup
-            retention_days = 1 if force else self.media_retention_days
-            cutoff_time = now - timedelta(days=retention_days)
-            
-            # List all files in downloads directory
-            if os.path.exists(self.downloads_dir):
-                files = os.listdir(self.downloads_dir)
-                deleted_count = 0
-                
-                for file in files:
-                    file_path = os.path.join(self.downloads_dir, file)
-                    
-                    # Skip if not a file
-                    if not os.path.isfile(file_path):
-                        continue
-                        
-                    # Get file modification time
-                    mod_time = datetime.fromtimestamp(os.path.getmtime(file_path))
-                    
-                    # Delete if older than cutoff
-                    if mod_time < cutoff_time:
-                        try:
-                            os.remove(file_path)
-                            if file_path in self.tracked_downloads:
-                                self.tracked_downloads.remove(file_path)
-                            deleted_count += 1
-                        except Exception as e:
-                            logger.error(f"Failed to delete old file {file_path}: {str(e)}")
-                
-                logger.info(f"Cleaned up {deleted_count} old downloaded media files")
+             for filename in os.listdir(self.downloads_dir):
+                  file_path = os.path.join(self.downloads_dir, filename)
+                  if file_path in self.tracked_downloads: # Skip already checked tracked files
+                       continue
+
+                  try:
+                       if os.path.isfile(file_path):
+                            mod_time_ts = os.path.getmtime(file_path)
+                            mod_time = datetime.utcfromtimestamp(mod_time_ts)
+                            if mod_time < cutoff:
+                                 file_size = os.path.getsize(file_path)
+                                 os.remove(file_path)
+                                 logger.debug(f"Deleted untracked old media file: {file_path} (Modified: {mod_time})")
+                                 cleaned_count += 1
+                                 cleaned_size += file_size
+                  except FileNotFoundError:
+                       continue # File might have been deleted between listdir and stat
+                  except Exception as e:
+                       logger.error(f"Error processing untracked file {file_path} during cleanup: {e}")
+
         except Exception as e:
-            logger.error(f"Error cleaning up old downloads: {str(e)}")
-            
-    async def _schedule_media_cleanup(self):
-        """Schedule periodic media cleanup."""
-        try:
-            while True:
-                # Run cleanup every 6 hours
-                await asyncio.sleep(6 * 60 * 60)
-                await self._cleanup_old_downloads()
-                
-                # Check disk space after cleanup
-                if not self._check_disk_space():
-                    logger.warning("Disk space still above threshold after regular cleanup, forcing more aggressive cleanup")
-                    await self._cleanup_old_downloads(force=True)
-        except asyncio.CancelledError:
-            logger.debug("Media cleanup task cancelled")
-        except Exception as e:
-            logger.error(f"Error in media cleanup task: {str(e)}")
-            
-    async def _retrieve_bot_info_from_tokens(self):
-        """
-        Dynamically retrieve bot information from provided bot tokens.
-        This avoids the need to manually specify bot usernames in the config.
-        """
-        import aiohttp
-        
-        # Don't do anything if no tokens are provided
-        if not self.config.bot_tokens:
-            logger.info("No bot tokens provided, skipping bot info retrieval")
-            return
-            
-        logger.info(f"Retrieving information for {len(self.config.bot_tokens)} bot tokens")
-        
-        # Set to collect bot usernames
-        retrieved_usernames = set()
-        
-        # Process each token
-        for token in self.config.bot_tokens:
-            try:
-                # Use aiohttp instead of requests for async compatibility
-                async with aiohttp.ClientSession() as session:
-                    url = f"https://api.telegram.org/bot{token}/getMe"
-                    async with session.get(url) as response:
-                        if response.status == 200:
-                            data = await response.json()
-                            
-                            if data.get("ok") and "result" in data:
-                                bot_info = data["result"]
-                                bot_username = bot_info.get("username")
-                                
-                                if bot_username:
-                                    logger.info(f"Successfully retrieved info for bot: {bot_username}")
-                                    retrieved_usernames.add(bot_username)
-                                    
-                                    # Store additional bot information if needed
-                                    # This could be expanded to store more metadata
-                                    bot_data = {
-                                        "id": bot_info.get("id"),
-                                        "first_name": bot_info.get("first_name"),
-                                        "username": bot_username,
-                                        "is_bot": bot_info.get("is_bot", True),
-                                        "token": token,
-                                        "retrieved_at": datetime.utcnow()
-                                    }
-                                    
-                                    # Store this info for later use if needed
-                                    # This is just in memory, but could be persisted in a database
-                                    if not hasattr(self, "_bot_info_cache"):
-                                        self._bot_info_cache = {}
-                                    self._bot_info_cache[bot_username] = bot_data
-                                    
-                                else:
-                                    logger.warning(f"Bot info retrieved but no username found for token: {token[:5]}...")
-                            else:
-                                logger.warning(f"Failed to retrieve bot info: {data.get('description', 'Unknown error')}")
-                        else:
-                            logger.warning(f"Failed to retrieve bot info, status code: {response.status}")
-            except Exception as e:
-                logger.error(f"Error retrieving bot info for token {token[:5]}...: {str(e)}")
-                
-        # Merge retrieved usernames with manually configured ones
-        if retrieved_usernames:
-            # Convert existing usernames to a set for deduplication
-            existing_usernames = set(self.config.bot_usernames)
-            
-            # Merge sets
-            all_usernames = existing_usernames.union(retrieved_usernames)
-            
-            # Update config with the combined list
-            self.config.bot_usernames = list(all_usernames)
-            
-            logger.info(f"Updated bot usernames list, now monitoring {len(self.config.bot_usernames)} bots")
+             logger.error(f"Error scanning downloads directory during cleanup: {e}")
+
+        if cleaned_count > 0:
+            logger.info(f"Cleaned up {cleaned_count} old media files (Total size: {cleaned_size / (1024*1024):.2f} MB).")
         else:
-            logger.warning("No bot usernames could be retrieved from tokens")
-    
-    async def close(self):
-        """Close Telegram clients."""
-        if self._main_client:
-            await self._main_client.disconnect()
-            logger.info("Telegram client disconnected")
+            logger.info("No old media files found needing cleanup.")
         
-        for client in self.clients.values():
-            await client.disconnect()
+    async def _schedule_media_cleanup(self):
+        """Periodically run the media cleanup task."""
+        while not self._shutdown_event.is_set():
+            try:
+                # Wait for 24 hours before next cleanup
+                await asyncio.wait_for(self._shutdown_event.wait(), timeout=24 * 3600)
+                # If wait finishes without timeout, shutdown was triggered
+                break
+            except asyncio.TimeoutError:
+                # Timeout occurred, run cleanup
+                await self._cleanup_old_downloads()
+            except asyncio.CancelledError:
+                 logger.info("Media cleanup scheduler cancelled.")
+                 break
+            except Exception as e:
+                 logger.error(f"Error in media cleanup scheduler: {e}")
+                 # Wait a shorter interval before retrying after an error
+                 await asyncio.sleep(3600) # Wait 1 hour before retry after error
+
+        logger.info("Media cleanup scheduler stopped.")
+        
+    async def close(self):
+        """Shut down all Telegram clients and tasks."""
+        logger.info(f"Shutting down Telegram Monitor. Closing {len(self.polling_tasks)} polling tasks...")
+        self._shutdown_event.set() # Signal all loops to stop
+
+        # Cancel all polling tasks
+        tasks_to_cancel = list(self.polling_tasks.values())
+        for task in tasks_to_cancel:
+            if not task.done():
+                task.cancel()
+
+        # Wait for tasks to finish cancellation
+        if tasks_to_cancel:
+             await asyncio.gather(*tasks_to_cancel, return_exceptions=True)
+             logger.debug("Polling tasks cancellation complete.")
+
+        # Disconnect all clients
+        clients_to_disconnect = list(self.bot_clients.values())
+        logger.info(f"Disconnecting {len(clients_to_disconnect)} Telegram clients...")
+        disconnect_tasks = []
+        for client in clients_to_disconnect:
+            if client.is_connected():
+                disconnect_tasks.append(asyncio.create_task(client.disconnect()))
+
+        if disconnect_tasks:
+            await asyncio.gather(*disconnect_tasks, return_exceptions=True)
+            logger.debug("Client disconnection complete.")
+
+        self.bot_clients.clear()
+        self.polling_tasks.clear()
+        logger.info("Telegram Monitor shut down.")

@@ -10,7 +10,7 @@ import logging
 import queue
 import threading
 from concurrent.futures import ThreadPoolExecutor
-from typing import Dict, List, Any, Callable, Coroutine, Optional
+from typing import Callable, Coroutine
 
 from config.settings import config
 

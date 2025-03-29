@@ -8,7 +8,7 @@ RisePro had significant growth in 2024 before being shut down in June 2024.
 import re
 import json
 import os
-from typing import Dict, List, Any, Tuple, Optional
+from typing import Dict, Any, Tuple
 from src.processing.stealer_plugins.base import StealerParserPlugin
 
 class RiseProParser(StealerParserPlugin):

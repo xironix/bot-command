@@ -3,7 +3,7 @@ Configuration settings for the Bot-Command application.
 """
 
 import os
-from typing import Dict, List, Optional
+from typing import List, Optional
 from pydantic import BaseModel, Field
 
 # Worker pool settings

@@ -4,11 +4,9 @@ Base class for stealer parser plugins.
 This module defines the base class that all stealer parser plugins must inherit from.
 """
 
-import re
-import json
 import base64
 from abc import ABC, abstractmethod
-from typing import Dict, List, Any, Optional, Tuple
+from typing import Dict, Any, Optional, Tuple
 from urllib.parse import urlparse
 import logging
 

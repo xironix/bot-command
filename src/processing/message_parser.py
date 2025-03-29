@@ -11,7 +11,7 @@ import os
 import re
 import traceback
 from datetime import datetime
-from typing import Dict, List, Any, Optional, Tuple
+from typing import Dict, List, Any, Optional
 import asyncio
 
 logger = logging.getLogger(__name__)
@@ -791,7 +791,7 @@ class MessageParser:
                 
             # Check for text file markers
             text_markers = [b'\n', b'\r', b' ', b'\t', b'{', b'[']
-            if any(marker in header for marker in text_markers) and not b'\x00' in header:
+            if any(marker in header for marker in text_markers) and b'\x00' not in header:
                 # Likely a text file
                 return True
                 
@@ -804,8 +804,13 @@ class MessageParser:
                 text_start = header.decode('utf-8', errors='ignore').strip()
                 if text_start.startswith('{') or text_start.startswith('['):
                     return True
-            except:
+            except UnicodeDecodeError:
+                # This specific exception is expected if the header isn't valid UTF-8
                 pass
+            except Exception as e:
+                # Catch other potential errors during strip/startswith
+                logger.warning(f"Unexpected error checking file header in _is_parsable_file for {file_path}: {e}")
+                pass # Continue check if possible, but log it
         except Exception as e:
             logger.error(f"Error examining file content for {file_path}: {str(e)}")
             
@@ -920,7 +925,6 @@ class MessageParser:
                         # Check for credential-like patterns in headers
                         username_idx = None
                         password_idx = None
-                        domain_idx = None
                         
                         for i, header in enumerate(headers):
                             header_lower = header.lower()
@@ -929,7 +933,7 @@ class MessageParser:
                             elif any(term in header_lower for term in ['password', 'pwd', 'pass']):
                                 password_idx = i
                             elif any(term in header_lower for term in ['domain', 'site', 'service']):
-                                domain_idx = i
+                                pass # Do nothing if we only find a domain header
                                 
                         # Process rows if we found credential columns
                         if username_idx is not None and password_idx is not None:
@@ -1054,7 +1058,6 @@ class MessageParser:
         import zipfile
         import tarfile
         import shutil
-        from pathlib import Path
         
         # Create a temporary directory for extraction
         temp_dir = tempfile.mkdtemp(prefix="botcommand_extract_")

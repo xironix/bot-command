@@ -4,7 +4,7 @@ XWorm Stealer parser plugin.
 This module implements a parser for the XWorm stealer format (hybrid RAT/stealer).
 """
 
-from typing import Dict, List, Any, Tuple
+from typing import Dict, Any, Tuple
 from src.processing.stealer_plugins.base import StealerParserPlugin
 
 class XWormParser(StealerParserPlugin):
