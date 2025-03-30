@@ -1,0 +1,175 @@
+name: xenoops
+services:
+  # MongoDB service
+  mongo:
+    image: mongo:latest
+    container_name: mongo
+    hostname: mongo.xenoops.net
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongodb_data:/data/db
+      - mongodb_dbcfg:/data/configdb
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+        reservations:
+          memory: 256M
+    restart: unless-stopped
+    networks:
+      - xenonet
+
+  # Setup service for generating certificates
+  setup:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.17.4
+    volumes:
+      - certs:/usr/share/elasticsearch/config/certs
+    user: "0"
+    command: >
+      bash -c '
+        if [ ! -f config/certs/ca.zip ]; then
+          echo "Creating CA";
+          bin/elasticsearch-certutil ca --silent --pem -out config/certs/ca.zip;
+          unzip config/certs/ca.zip -d config/certs;
+        fi;
+        if [ ! -f config/certs/certs.zip ]; then
+          echo "Creating certs";
+          echo -ne \
+          "instances:\n"\
+          "  - name: elastic\n"\
+          "    dns:\n"\
+          "      - elastic\n"\
+          "      - elastic.xenoops.net\n"\
+          "      - localhost\n"\
+          "    ip:\n"\
+          "      - 127.0.0.1\n"\
+          "  - name: kibana\n"\
+          "    dns:\n"\
+          "      - kibana\n"\
+          "      - kibana.xenoops.net\n"\
+          "      - localhost\n"\
+          "    ip:\n"\
+          "      - 127.0.0.1\n"\
+          > config/certs/instances.yml;
+          bin/elasticsearch-certutil cert --silent --pem -out config/certs/certs.zip --in config/certs/instances.yml --ca-cert config/certs/ca/ca.crt --ca-key config/certs/ca/ca.key;
+          unzip config/certs/certs.zip -d config/certs;
+        fi;
+        echo "Setting file permissions";
+        chown -R 1000:0 config/certs;
+        find config/certs -type d -exec chmod 755 \{\} \;;
+        find config/certs -type f -exec chmod 644 \{\} \;;
+        # Create a marker file to indicate completion
+        touch config/certs/setup_complete;
+        echo "Setup completed";
+        sleep 5; # Give some time for any filesystem sync operations
+      '
+    # This is a one-shot container, no healthcheck needed
+    restart: "no"
+
+  # Elasticsearch service
+  elastic:
+    depends_on:
+      - setup
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.17.4
+    volumes:
+      - certs:/usr/share/elasticsearch/config/certs
+      - elastic_data:/usr/share/elasticsearch/data
+    container_name: elastic
+    hostname: elastic.xenoops.net
+    ports:
+      - "9200:9200"
+      - "9300:9300"
+    environment:
+      - node.name=elastic
+      - discovery.type=single-node
+      - ELASTIC_PASSWORD=nuGfOfXDjbD7ZxMrsrmw  # Updated password
+      - bootstrap.memory_lock=true
+      - "ES_JAVA_OPTS=-Xms512m -Xmx512m"
+      - xpack.security.enabled=true
+      - xpack.security.http.ssl.enabled=true
+      - xpack.security.enrollment.enabled=true
+      - xpack.security.http.ssl.key=certs/elastic/elastic.key
+      - xpack.security.http.ssl.certificate=certs/elastic/elastic.crt
+      - xpack.security.http.ssl.certificate_authorities=certs/ca/ca.crt
+      - xpack.security.http.ssl.verification_mode=certificate
+      - xpack.security.transport.ssl.enabled=true
+      - xpack.security.transport.ssl.key=certs/elastic/elastic.key
+      - xpack.security.transport.ssl.certificate=certs/elastic/elastic.crt
+      - xpack.security.transport.ssl.certificate_authorities=certs/ca/ca.crt
+      - xpack.security.transport.ssl.verification_mode=certificate
+      - xpack.license.self_generated.type=trial
+    mem_limit: 1024M
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "curl -s --cacert config/certs/ca/ca.crt https://localhost:9200 | grep -q 'missing authentication credentials'",
+        ]
+      interval: 10s
+      timeout: 10s
+      retries: 120
+    restart: unless-stopped
+    networks:
+      - xenonet
+
+  # Kibana service
+  kibana:
+    depends_on:
+      elastic:
+        condition: service_healthy
+    image: docker.elastic.co/kibana/kibana:8.17.4
+    container_name: kibana
+    hostname: kibana.xenoops.net
+    volumes:
+      - certs:/usr/share/kibana/config/certs
+      - kibana_data:/usr/share/kibana/data
+    ports:
+      - "5601:5601"
+    environment:
+      - SERVERNAME=kibana
+      - ELASTICSEARCH_HOSTS=https://elastic:9200
+      - ELASTICSEARCH_USERNAME=kibana_system
+      - ELASTICSEARCH_PASSWORD=mEDcFIMm_IBiaHLOAL7v
+      - ELASTICSEARCH_SSL_CERTIFICATEAUTHORITIES=config/certs/ca/ca.crt
+      - xpack.security.audit.enabled=true
+      - NODE_OPTIONS="--max-old-space-size=1024"
+    mem_limit: 1536M
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "curl -s -I http://localhost:5601 | grep -q 'HTTP/1.1 302 Found'",
+        ]
+      interval: 10s
+      timeout: 10s
+      retries: 120
+    restart: unless-stopped
+    networks:
+      - xenonet
+
+volumes:
+  certs:
+    name: certs
+    driver: local
+  mongodb_data:
+    name: mongodb_data
+    external: true
+  mongodb_dbcfg:
+    name: mongodb_dbcfg
+    driver: local
+  elastic_data:
+    name: elastic_data
+    driver: local
+  kibana_data:
+    name: kibana_data
+    driver: local
+
+networks:
+  xenonet:
+    name: xenonet
+    driver: bridge

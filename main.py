@@ -7,15 +7,14 @@ Telegram-based stealer bots without modifying their behavior or alerting operato
 """
 
 # Standard library imports first
-import asyncio
 import argparse
 import logging
 import os
-import signal
 import sys
 from datetime import datetime
 from logging.handlers import RotatingFileHandler
 from rich.logging import RichHandler
+from contextlib import asynccontextmanager
 
 # Third-party imports
 from dotenv import load_dotenv
@@ -23,20 +22,40 @@ from fastapi import FastAPI, Request, HTTPException
 from pydantic import BaseModel
 import uvicorn
 
+# Load .env file BEFORE anything else reads environment variables
+load_dotenv()
+
 # Local application/library specific imports
 from src.coordinator import Coordinator
-from src.config import load_env_vars
-from src.database.init_db import init_database
+# Import both the function and the global config object
+from config.settings import load_config, config
 
-# Load environment variables AFTER imports but BEFORE using them
-load_dotenv()
+# Add project root to the Python path
+project_root = os.path.dirname(os.path.abspath(__file__))
+if project_root not in sys.path:
+    sys.path.insert(0, project_root)
+
+# Parse command line arguments BEFORE loading configuration
+def parse_arguments():
+    """Parse command line arguments."""
+    parser = argparse.ArgumentParser(description="Bot-Command Monitoring Tool")
+    parser.add_argument("--debug", action="store_true", help="Enable debug mode")
+    return parser.parse_args()
+
+# Parse arguments
+args = parse_arguments()
+
+# Update config based on command line arguments
+if args.debug:
+    config.debug = True
+    config.log_level = "DEBUG"
+    print("Debug mode enabled via command line argument")
 
 # Create logs directory if it doesn't exist
 os.makedirs("logs", exist_ok=True)
 
-# Get log level from environment
-log_level_name = os.getenv("LOG_LEVEL", "INFO").upper()
-log_level = getattr(logging, log_level_name, logging.INFO)
+# Get log level from the config object
+log_level = getattr(logging, config.log_level, logging.INFO)
 
 # Configure rotating file handler
 log_file = f"logs/bot_command_{datetime.now().strftime('%Y%m%d')}.log"
@@ -47,43 +66,51 @@ file_handler = RotatingFileHandler(
     encoding="utf-8"
 )
 
-# Set formatter for the file handler (optional but good practice)
+# Set formatter for the file handler
 file_formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 file_handler.setFormatter(file_formatter)
 
-# Configure basic logging (without handlers initially)
-# Remove format, as RichHandler handles console format
-# Remove handlers, as we'll add them manually
-logging.basicConfig(
-    level=log_level,
-    handlers=[] # Start with no handlers here
-)
+# Get the root logger
+root_logger = logging.getLogger()
+root_logger.setLevel(log_level) # Set the overall level
+
+# Clear existing handlers
+if root_logger.hasHandlers():
+    root_logger.handlers.clear()
 
 # Create RichHandler for console output
 rich_handler = RichHandler(
-    level=log_level, # Set level for this handler
+    level=log_level, 
     show_time=True,
     show_level=True,
-    show_path=False, # Don't show path by default, can be noisy
-    markup=True, # Enable Rich markup in log messages
-    rich_tracebacks=True # Enable rich tracebacks
+    show_path=False, 
+    markup=True, 
+    rich_tracebacks=True
 )
 
-# Add handlers to the root logger
-root_logger = logging.getLogger()
-root_logger.addHandler(rich_handler) # Add colorful console handler
-root_logger.addHandler(file_handler) # Add rotating file handler
+# Add ONLY our configured handlers
+root_logger.addHandler(rich_handler)
+root_logger.addHandler(file_handler)
 
 # Set specific log levels for noisy libraries
 logging.getLogger("telethon").setLevel(logging.WARNING)
 logging.getLogger("asyncio").setLevel(logging.WARNING)
+logging.getLogger("uvicorn").setLevel(logging.WARNING)
+logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
 logging.getLogger("urllib3").setLevel(logging.WARNING)
 logging.getLogger("elasticsearch").setLevel(logging.WARNING)
 
+# Get logger for this module AFTER logging is configured
 logger = logging.getLogger(__name__)
 
+# Log the effective level to confirm configuration
+root_logger = logging.getLogger() # Get the root logger
+logger.info(f"Effective logging level set to: {logging.getLevelName(root_logger.getEffectiveLevel())}")
+
+# --- End Logging Configuration --- 
+
 # Global coordinator instance
-coordinator = None
+coordinator = None  # Will be instantiated in startup_event
 
 # --- Pydantic Model for Telegram Update ---
 class TelegramUpdate(BaseModel):
@@ -96,12 +123,58 @@ class TelegramUpdate(BaseModel):
     class Config:
         extra = 'allow' # Allow extra fields not explicitly defined
 
-# --- Global coordinator and FastAPI app ---
-coordinator = Coordinator() # Instantiate coordinator globally
-app = FastAPI(title="Bot-Command Monitor", version="0.1.0")
+# Global variable for Coordinator
+coordinator: Coordinator | None = None 
 
-# Load environment variables (consider doing this earlier if needed by logging)
-# env_vars = load_env_vars() # Might need adjustment based on FastAPI startup
+# --- Lifespan Context Manager ---
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Manages application startup and shutdown operations."""
+    global coordinator # Access the global coordinator
+
+    logger.info("Application startup sequence initiated...")
+    
+    # Initialize Coordinator first (dependency for webhooks)
+    logger.info("Initializing Coordinator...")
+    
+    # Create a new coordinator or use the existing one
+    if coordinator is None:
+        coordinator = Coordinator()
+    
+    await coordinator.initialize()
+    logger.info("Coordinator initialized.")
+    
+    # Clean up old log files
+    purge_old_logs() 
+    
+    # Register webhooks using the URL from the config object
+    webhook_base_url = config.telegram.webhook_base_url # Use config value
+    if webhook_base_url:
+        logger.info(f"Registering webhooks with base URL: {webhook_base_url}")
+        await coordinator.register_webhooks(webhook_base_url)
+        logger.info("Webhooks registration process initiated.")
+    else:
+        logger.warning("WEBHOOK_BASE_URL not set in config/env. Skipping webhook registration.")
+
+    logger.info("Bot-Command Monitor is ready to receive updates.")
+    
+    yield # Application runs here
+
+    # --- Shutdown logic ---
+    logger.info("Application shutdown sequence initiated...")
+    if coordinator:
+        logger.info("Shutting down Coordinator...")
+        await coordinator.shutdown()
+        logger.info("Coordinator shut down.")
+    else:
+        logger.info("Coordinator not initialized, skipping shutdown.")
+    logger.info("Bot-Command shut down complete.")
+
+
+# Initialize FastAPI app with the lifespan manager
+app = FastAPI(lifespan=lifespan)
+
+# --- Utility Functions ---
 
 # Purge old log files
 def purge_old_logs(log_dir="logs", max_days=30):
@@ -164,64 +237,42 @@ def purge_old_logs(log_dir="logs", max_days=30):
 # def parse_arguments():
 #    ... (removed) ...
 
-# --- FastAPI Lifespan Events ---
-@app.on_event("startup")
-async def startup_event():
-    """Handles application startup: initialize coordinator and set webhooks."""
-    logger.info("Application startup...")
-    
-    # Clean up old log files
-    purge_old_logs() # Keep log purging
-    
-    logger.info("Initializing Coordinator...")
-    await coordinator.initialize()
-    
-    # Register webhooks for active bots using the provided URL
-    webhook_base_url = "https://webhook.xenoops.net"
-    logger.info(f"Registering webhooks with base URL: {webhook_base_url}")
-    await coordinator.register_webhooks(webhook_base_url)
-    
-    # The old start_monitoring() call is removed as webhooks replace polling.
-    # logger.info("Registering webhooks (placeholder)...") 
-    # Example: await coordinator.register_webhooks("https://webhook.xenoops.net/webhook") 
-    
-    logger.info("Coordinator initialized and webhooks set.")
-    logger.info("Bot-Command Monitor is ready to receive updates.")
-
-@app.on_event("shutdown")
-async def shutdown_event():
-    """Handles application shutdown: cleanup coordinator resources."""
-    logger.info("Application shutdown...")
-    if coordinator:
-        logger.info("Shutting down Coordinator...")
-        await coordinator.shutdown()
-    logger.info("Bot-Command shut down complete.")
-
 # --- FastAPI Endpoints ---
 @app.get("/")
 async def read_root():
     """Root endpoint for health check."""
     return {"message": "Bot-Command Monitor Active"}
 
-@app.post("/webhook/{token}")
-async def handle_webhook(token: str, update: TelegramUpdate, request: Request):
-    """Receives webhook updates from Telegram for a specific bot token."""
+@app.post("/{bot_username}")
+async def handle_webhook(bot_username: str, update: TelegramUpdate, request: Request):
+    """Receives webhook updates from Telegram for a specific bot username."""
+    # Add check to ensure coordinator is initialized
+    if coordinator is None:
+        logger.error("Received webhook request before Coordinator was initialized.")
+        raise HTTPException(status_code=503, detail="Service temporarily unavailable, please retry shortly.")
+        
     # Optional: Verify source IP matches Telegram's ranges
     # client_host = request.client.host
     # if not is_telegram_ip(client_host): # Implement is_telegram_ip check
     #     logger.warning(f"Received webhook from untrusted IP: {client_host}")
     #     raise HTTPException(status_code=403, detail="Forbidden")
 
-    logger.debug(f"Received webhook for token {token[:4]}...: {update.dict()}")
-    
-    # Pass the update to the coordinator for processing
+    logger.debug(f"Received webhook for username '{bot_username}': {list(update.dict().keys())}")
+
+    # Look up the token for the given username
+    token = await coordinator.get_token_for_username(bot_username)
+
+    if not token:
+        logger.warning(f"Webhook received for unknown or inactive bot username: {bot_username}")
+        raise HTTPException(status_code=404, detail="Bot username not found or not monitored")
+
+    # Pass the update and the resolved token to the coordinator
     try:
         # Convert Pydantic model back to dict for existing handler (if needed)
         # or adapt handler to accept the Pydantic model directly
         await coordinator.handle_webhook_update(token, update.dict()) 
-        # ^^^ NOTE: handle_webhook_update method needs to be created in Coordinator
     except Exception as e:
-        logger.error(f"Error processing webhook update for token {token[:4]}...: {e}", exc_info=True)
+        logger.error(f"Error processing webhook update for bot {bot_username} (token {token[:4]}...): {e}", exc_info=True)
         # Return 500 to Telegram so it retries later
         raise HTTPException(status_code=500, detail="Internal Server Error")
 
@@ -232,18 +283,20 @@ async def handle_webhook(token: str, update: TelegramUpdate, request: Request):
 # async def main():
 #    ... (removed) ...
 
-if __name__ == "__main__":
-    # Configure log level based on environment variable (similar to before)
-    log_level_name = os.getenv("LOG_LEVEL", "INFO").upper()
-    initial_log_level = getattr(logging, log_level_name, logging.INFO)
-    logging.getLogger().setLevel(initial_log_level)
-    logger.info(f"Log level set to {log_level_name}")
+# Log the effective log level before starting server
+logger.info(f"Final check: Effective logging level set to: {logging.getLevelName(logging.getLogger().getEffectiveLevel())}")
 
+if __name__ == "__main__":
     # Run the FastAPI application using uvicorn
-    # Get port from environment variable or default to 8000
     port = int(os.getenv("PORT", "8000"))
-    logger.info(f"Starting web server on 0.0.0.0:{port}")
+    logger.info(f"Starting web server on 0.0.0.0:{port} with HTTPS")
     
-    # Note: For production, disable reload=True
-    # Note: Ensure this port is reachable by Telegram (e.g., via reverse proxy to 443)
-    uvicorn.run("main:app", host="0.0.0.0", port=port, reload=False) # Changed reload to False
+    uvicorn.run(
+        "main:app", 
+        host="0.0.0.0", 
+        port=port, 
+        reload=False, 
+        log_config=None, 
+        ssl_keyfile="config/ssl/privkey.pem", 
+        ssl_certfile="config/ssl/fullchain.pem"
+    )

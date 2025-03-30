@@ -25,11 +25,20 @@ class MongoDBManager:
         """Initialize MongoDB manager."""
         self.config = config.mongodb
         
+        # --- DEBUG: Print the URI being used ---
+        print(f"DEBUG [mongo_client]: Attempting to connect with URI: {self.config.uri}")
+        logger.debug(f"Attempting to connect with URI: {self.config.uri}") # Also log it
+        # --- END DEBUG ---
+        
         # Synchronous client for initialization and index creation
+        # Explicitly pass the URI again for debugging
+        print(f"DEBUG [mongo_client]: Initializing sync_client with URI: {self.config.uri}")
         self.sync_client = MongoClient(self.config.uri)
         self.sync_db = self.sync_client[self.config.database]
         
         # Asynchronous client for operations
+        # Explicitly pass the URI again for debugging
+        print(f"DEBUG [mongo_client]: Initializing async_client with URI: {self.config.uri}")
         self.async_client = motor.motor_asyncio.AsyncIOMotorClient(self.config.uri)
         self.async_db = self.async_client[self.config.database]
         
@@ -395,21 +404,22 @@ class MongoDBManager:
                 return False
             raise
 
-    async def get_active_bot_tokens(self) -> List[str]:
+    async def get_active_bots(self) -> List[Dict[str, str]]:
         """
-        Get list of active bot tokens.
+        Get list of active bots with their usernames and tokens.
         
         Returns:
-            List of active bot tokens
+            List of dictionaries, each containing 'username' and 'token' for an active bot.
         """
         cursor = self.monitored_bots.find(
-            {"status": "active"},
-            projection={"token": 1, "_id": 0}
+            {"status": "active", "username": {"$ne": None}},
+            projection={"token": 1, "username": 1, "_id": 0}
         )
-        tokens = []
+        bots = []
         async for doc in cursor:
-            tokens.append(doc["token"])
-        return tokens
+            if "username" in doc and "token" in doc:
+                bots.append({"username": doc["username"], "token": doc["token"]})
+        return bots
 
     async def update_bot_status(self, token: str, *, 
                               status: Optional[str] = None,

@@ -8,6 +8,7 @@ Telegram monitoring, message processing, and data storage.
 import asyncio
 import logging
 import os
+import json # Add json import for parsing potential error details
 from datetime import datetime, timedelta
 from typing import Dict, List, Any, Optional
 
@@ -73,15 +74,21 @@ class Coordinator:
         logger.info("Initializing Bot-Command coordinator")
         
         # Initialize worker pool
+        logger.debug("Initializing worker pool...")
         await self.worker_pool.start()
+        logger.debug("Worker pool initialized.")
         
         # Initialize Elasticsearch (if available)
+        logger.debug("Initializing Elasticsearch manager...")
         elastic_available = await self.elastic_manager.initialize()
         if not elastic_available:
             logger.warning("Elasticsearch is not available, some features will be limited")
+        logger.debug("Elasticsearch manager initialized (available: %s).", elastic_available)
             
         # Initialize Telegram monitor
+        logger.debug("Initializing Telegram monitor...")
         await self.telegram_monitor.initialize()
+        logger.debug("Telegram monitor initialized.")
         
         self.initialized = True
         logger.info("Bot-Command coordinator initialized")
@@ -136,6 +143,13 @@ class Coordinator:
                 
         # logger.info("Bot monitoring started")
         
+    async def get_token_for_username(self, username: str) -> Optional[str]:
+        """Fetches the bot token associated with a given username."""
+        bot_info = await self.mongo_manager.get_bot_info(username=username)
+        if bot_info and bot_info.get("status") == "active":
+            return bot_info.get("token")
+        return None
+
     # --- Webhook Handling --- 
 
     async def handle_webhook_update(self, token: str, update_data: Dict[str, Any]):
@@ -180,61 +194,87 @@ class Coordinator:
             logger.warning(f"Received webhook update for {token[:4]}... with unhandled type or no content: {list(update_data.keys())}")
 
     async def register_webhooks(self, base_webhook_url: str):
-        """Registers webhooks with Telegram for all active bots."""
+        """Registers webhooks with Telegram for all active bots using usernames."""
         logger.info(f"Attempting to register webhooks with base URL: {base_webhook_url}")
         
-        active_tokens = [] # Default to empty list
-        # Fetch active tokens from MongoDB
+        active_bots = [] # Default to empty list
+        # Fetch active bots (username and token) from MongoDB
         try:
-            active_tokens = await self.mongo_manager.get_active_bot_tokens() 
-            if not active_tokens:
-                logger.warning("MongoDB returned no active bot tokens to register webhooks for.")
-        except PyMongoError as e: # Make sure PyMongoError is imported if not already
-            logger.error(f"Database error fetching active bot tokens: {e}", exc_info=True)
-            # Decide if we should proceed without tokens or raise/exit
-            active_tokens = [] # Ensure it's empty on error
+            active_bots = await self.mongo_manager.get_active_bots() # Updated call
+            if not active_bots:
+                logger.warning("MongoDB returned no active bots to register webhooks for.")
+        except PyMongoError as e:
+            logger.error(f"Database error fetching active bots: {e}", exc_info=True)
+            active_bots = [] 
         except Exception as e:
-            logger.error(f"Unexpected error fetching active bot tokens: {e}", exc_info=True)
-            active_tokens = [] # Ensure it's empty on error
+            logger.error(f"Unexpected error fetching active bots: {e}", exc_info=True)
+            active_bots = []
 
-        if not active_tokens:
-             logger.warning("No active bot tokens found or fetched. Cannot register webhooks.")
-             # Potentially start stats task anyway?
-             # if not self.stats_task or self.stats_task.done():
-             #    logger.info("Starting periodic statistics reporting (no webhooks registered).")
-             #    self.stats_task = asyncio.create_task(self._report_stats_periodically())
-             return # Exit if no tokens
+        if not active_bots:
+             logger.warning("No active bots found or fetched. Cannot register webhooks.")
+             return # Exit if no bots
 
         async with aiohttp.ClientSession() as session:
-            for token in active_tokens:
-                if not token or ':' not in token: # Basic validation
-                    logger.warning(f"Skipping invalid token format: {token[:10]}...")
+            for bot in active_bots: # Loop through bot dictionaries
+                token = bot.get("token")
+                username = bot.get("username")
+
+                if not token or ':' not in token or not username:
+                    logger.warning(f"Skipping invalid bot data: {bot}")
                     continue
                 
-                webhook_endpoint = f"/webhook/{token}" # Define specific path per token
+                webhook_endpoint = f"/{username}"
                 full_webhook_url = base_webhook_url.rstrip('/') + webhook_endpoint
                 api_url = f"https://api.telegram.org/bot{token}/setWebhook"
-                
                 payload = {"url": full_webhook_url}
-                # Optional: Add allowed_updates, drop_pending_updates, secret_token etc.
-                # payload["allowed_updates"] = ["message", "edited_message", ...]
-                # payload["drop_pending_updates"] = True
-                
-                try:
-                    logger.info(f"Setting webhook for token {token[:4]}... to {full_webhook_url}")
-                    async with session.post(api_url, json=payload) as response:
-                        resp_json = await response.json()
-                        if response.status == 200 and resp_json.get("ok"):
-                            logger.info(f"Successfully set webhook for token {token[:4]}... Result: {resp_json.get('description')}")
-                        else:
-                            error_desc = resp_json.get("description", "Unknown error")
-                            logger.error(f"Failed to set webhook for token {token[:4]}... Status: {response.status}, Error: {error_desc}")
-                except aiohttp.ClientError as e:
-                    logger.error(f"HTTP Client error setting webhook for token {token[:4]}...: {e}")
-                except Exception as e:
-                    logger.error(f"Unexpected error setting webhook for token {token[:4]}...: {e}", exc_info=True)
 
-        # Start statistics reporting task after webhooks are set
+                # --- Retry Logic for setWebhook --- 
+                max_retries = 3
+                base_delay = 1.0 # seconds
+                attempt = 0
+                success = False
+                while attempt < max_retries and not success:
+                    attempt += 1
+                    try:
+                        logger.info(f"Attempt {attempt}/{max_retries} to set webhook for bot '{username}' (token prefix: {token[:6]}) to URL: {full_webhook_url}")
+                        async with session.post(api_url, json=payload, timeout=aiohttp.ClientTimeout(total=15)) as response:
+                            resp_text = await response.text() # Read text first for better error parsing
+                            try:
+                                resp_json = json.loads(resp_text) # Try parsing JSON
+                            except json.JSONDecodeError:
+                                resp_json = {} # Use empty dict if not JSON
+                                logger.warning(f"Non-JSON response received from Telegram for {username} (Status: {response.status}): {resp_text[:200]}...")
+
+                            if response.status == 200 and resp_json.get("ok"):
+                                logger.info(f"Successfully set webhook for bot '{username}' to {full_webhook_url}. Telegram says: {resp_json.get('description')}")
+                                success = True # Mark as success to break loop
+                            elif response.status == 429: # Rate limit error
+                                retry_after = int(resp_json.get("parameters", {}).get("retry_after", base_delay * (2 ** (attempt - 1))))
+                                wait_time = min(retry_after, 60) + (0.5 * attempt) # Use retry_after, cap it, add jitter
+                                logger.warning(f"Rate limit hit (429) for bot '{username}'. Retrying attempt {attempt+1}/{max_retries} after {wait_time:.2f} seconds.")
+                                await asyncio.sleep(wait_time)
+                            else:
+                                error_desc = resp_json.get("description", resp_text) # Use text if no description
+                                logger.error(f"Failed to set webhook for bot '{username}' (Attempt {attempt}/{max_retries}). Status: {response.status}, Error: {error_desc}")
+                                # Break on non-429 errors unless you want to retry other errors too
+                                break # Stop retrying for this bot on other errors
+
+                    except asyncio.TimeoutError:
+                         logger.error(f"Timeout during attempt {attempt}/{max_retries} to set webhook for bot '{username}' at {full_webhook_url}")
+                         if attempt < max_retries: await asyncio.sleep(base_delay * (2 ** attempt))
+                    except aiohttp.ClientError as e:
+                        logger.error(f"HTTP Client error setting webhook for bot '{username}' (Attempt {attempt}/{max_retries}): {e}")
+                        if attempt < max_retries: await asyncio.sleep(base_delay * (2 ** attempt))
+                    except Exception as e:
+                        logger.error(f"Unexpected error setting webhook for bot '{username}' (Attempt {attempt}/{max_retries}): {e}", exc_info=True)
+                        # Stop retrying on unexpected errors
+                        break 
+                # --- End Retry Logic ---
+                
+                if not success:
+                     logger.error(f"Failed to set webhook for bot '{username}' after {max_retries} attempts.")
+
+        # Start statistics reporting task after webhooks are set (or attempted)
         if not self.stats_task or self.stats_task.done():
             logger.info("Starting periodic statistics reporting.")
             self.stats_task = asyncio.create_task(self._report_stats_periodically())

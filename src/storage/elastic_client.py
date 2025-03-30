@@ -10,6 +10,8 @@ import os  # Import os module
 from datetime import datetime, timedelta
 from typing import Dict, List, Any
 from urllib.parse import urlparse # Added import
+import ssl # Import ssl module
+import socket # Added import
 
 from elasticsearch import AsyncElasticsearch
 from elasticsearch.helpers import async_bulk
@@ -25,30 +27,95 @@ class ElasticsearchManager:
         """Initialize Elasticsearch manager."""
         self.config = config.elasticsearch
         
-        # --- Explicitly read auth from environment variables ---
-        es_username = os.getenv("ELASTICSEARCH_USERNAME")
-        es_password = os.getenv("ELASTICSEARCH_PASSWORD")
+        # --- Read auth from config --- 
         auth_params = {}
-        if es_username and es_password:
-            auth_params['basic_auth'] = (es_username, es_password)
-            logger.info("Using Elasticsearch Basic authentication.")
-        else:
-            logger.info("No explicit Elasticsearch authentication credentials found in environment.")
-
-        # --- Parse the URI to separate endpoint from potential inline auth ---
-        # logger.debug(f"Raw Elasticsearch URI from config: {self.config.uri}") # Keep this for now
-        print(f"!!! DEBUG: Raw Elasticsearch URI before parse: {self.config.uri}") # <-- ADDED PRINT
-        parsed_uri = urlparse(self.config.uri)
-        print(f"!!! DEBUG: Parsed scheme: {parsed_uri.scheme}") # <-- ADDED PRINT
-        host_uri = f"{parsed_uri.scheme}://{parsed_uri.hostname}:{parsed_uri.port}"
-        logger.info(f"Connecting to Elasticsearch endpoint: {host_uri}")
-
-        self.client = AsyncElasticsearch(
-            [host_uri],         # Use parsed URI without inline auth
-            verify_certs=False, # Disable SSL verification for self-signed certs
-            **auth_params       # Pass basic auth credentials separately
-        )
         
+        # Check for username and password in config
+        if self.config.username and self.config.password:
+            logger.info(f"Found Elasticsearch credentials in config: username={self.config.username}")
+            auth_params['basic_auth'] = (self.config.username, self.config.password)
+            logger.info("Using Elasticsearch Basic authentication from config.")
+        else:
+            logger.warning("No Elasticsearch authentication credentials found in config. This will likely fail with 401 Unauthorized.")
+            
+        # Parse URI to determine if HTTPS
+        self.main_uri = self.config.uri
+        self.is_https = self.main_uri.startswith("https://")
+        logger.info(f"Elasticsearch URI scheme: {'HTTPS' if self.is_https else 'HTTP'}")
+            
+        # --- Configure SSL explicitly --- 
+        verify_certs_value = self.config.verify_certs
+        ca_certs_path = None
+        
+        # Log connection info
+        logger.info(f"Connecting to Elasticsearch endpoint: {self.config.uri}")
+        
+        # Use SSL Certificate Authority if provided in env and verification is enabled
+        if verify_certs_value:
+            ca_certs_env = os.getenv("ELASTICSEARCH_CA_CERTS")
+            if ca_certs_env:
+                if os.path.exists(ca_certs_env):
+                    ca_certs_path = ca_certs_env
+                    logger.info(f"Using CA certificate for verification: {ca_certs_path}")
+                else:
+                    logger.warning(f"CA certificate not found at: {ca_certs_env}")
+        else:
+            logger.info("Skipping CA certificate check as verification is disabled.")
+        
+        # --- Initialize Client with Conditional Arguments --- 
+
+        # Store URI
+        self.main_uri = self.config.uri
+        self.is_https = self.main_uri.startswith("https://")
+        
+        # Always force disable certificate verification for development
+        verify_certs_setting = False
+        
+        # Configure SSL context manually
+        ssl_context = None
+        if self.is_https:
+            import ssl
+            # Create a custom SSL context that doesn't verify certificates
+            ssl_context = ssl.create_default_context()
+            ssl_context.check_hostname = False
+            ssl_context.verify_mode = ssl.CERT_NONE
+            # Some environments need this for older/self-signed certificates
+            ssl_context.options |= ssl.OP_LEGACY_SERVER_CONNECT
+            
+            # Additional options to make it more permissive
+            # Disable certificate verification entirely
+            ssl_context.verify_flags = ssl.VERIFY_DEFAULT
+            # Set minimum TLS version to be more permissive
+            ssl_context.minimum_version = ssl.TLSVersion.TLSv1
+        
+        # Main client args
+        self.es_args = {
+            "hosts": [self.main_uri],
+            "verify_certs": verify_certs_setting,
+            "ssl_show_warn": False,  # Don't show SSL warnings when we've disabled verification
+            "timeout": 30,  # Set a reasonable timeout
+            "retry_on_timeout": True  # Retry when connection timeouts occur
+        }
+        
+        # Add SSL context if needed
+        if ssl_context and self.is_https:
+            self.es_args["ssl_context"] = ssl_context
+        
+        # Add basic auth if configured
+        if self.config.username and self.config.password:
+            self.es_args["basic_auth"] = (self.config.username, self.config.password)
+
+        # Log the *actual* verification setting being used
+        logger.info(f"Certificate verification for ES client set to: {self.es_args['verify_certs']}")
+        logger.info(f"Using custom SSL context: {ssl_context is not None}")
+        
+        # Try connecting with a timeout to avoid hanging
+        try:
+            self.client = AsyncElasticsearch(**self.es_args)
+        except Exception as e:
+            logger.error(f"Error initializing Elasticsearch client: {e}", exc_info=True)
+            self.client = None
+            
         # Index names
         self.credentials_index = f"{self.config.index_prefix}-credentials"
         self.cookies_index = f"{self.config.index_prefix}-cookies"
@@ -61,22 +128,95 @@ class ElasticsearchManager:
         """Initialize Elasticsearch indices and templates."""
         # Check if Elasticsearch is available
         try:
-            if not await self.client.ping():
-                logger.warning("Elasticsearch is not available")
+            logger.info("Attempting to connect to Elasticsearch...")
+            
+            # Add more detailed debug about connection settings
+            logger.info(f"Connection settings: URI={self.main_uri}, verify_certs={self.config.verify_certs}")
+            
+            # Skip if client initialization failed
+            if not self.client:
+                logger.warning("Elasticsearch client was not initialized properly")
                 return False
                 
-            logger.info("Elasticsearch is available")
-            
-            # Create indices with mappings
-            await self._create_indices()
-            
-            return True
+            # Try to ping with verbose debugging
+            try:
+                # Add detailed network debugging - socket level
+                uri_parts = urlparse(self.main_uri)
+                hostname = uri_parts.hostname
+                port = uri_parts.port or (443 if uri_parts.scheme == 'https' else 80)
+                
+                # Try a simple socket connection to see if the host is reachable
+                logger.info(f"Testing basic socket connection to {hostname}:{port}")
+                try:
+                    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                    s.settimeout(5)
+                    s.connect((hostname, port))
+                    s.close()
+                    logger.info(f"Socket connection to {hostname}:{port} successful")
+                except Exception as socket_err:
+                    logger.error(f"Socket connection to {hostname}:{port} failed: {socket_err}")
+                    
+                    # Try alternative port 9200 directly if default HTTPS port failed
+                    try:
+                        alt_port = 9200
+                        logger.info(f"Trying alternative port: {hostname}:{alt_port}")
+                        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                        s.settimeout(5)
+                        s.connect((hostname, alt_port))
+                        s.close()
+                        logger.info(f"Socket connection to {hostname}:{alt_port} successful")
+                    except Exception as alt_socket_err:
+                        logger.error(f"Alternative socket connection also failed: {alt_socket_err}")
+                
+                # Try manually accessing via HTTP to test if HTTPS is the issue
+                # logger.info("Checking if HTTP is available instead of HTTPS...")
+                # try:
+                #     import requests
+                #     http_url = self.main_uri.replace("https://", "http://")
+                #     logger.info(f"Trying HTTP URL: {http_url}")
+                #     requests.get(http_url, timeout=5, verify=False)
+                #     logger.info("HTTP connection successful - consider changing to HTTP in .env")
+                # except Exception as http_err:
+                #     logger.warning(f"HTTP attempt also failed: {http_err}")
+                
+                # Now try the actual ping
+                logger.info("Attempting Elasticsearch ping...")
+                ping_result = await self.client.ping()
+                if ping_result:
+                    logger.info("Elasticsearch is available - ping succeeded")
+                    await self._create_indices()
+                    return True
+                else:
+                    logger.warning("Elasticsearch is not available - ping failed")
+                    return False
+            except Exception as e:
+                logger.error(f"Error pinging Elasticsearch: {e}")
+                logger.error(f"Error type: {type(e).__name__}")
+                return False
+                
         except Exception as e:
+            # Log more details about the connection error
             logger.error(f"Failed to initialize Elasticsearch: {str(e)}")
+            logger.error(f"Error type: {type(e).__name__}")
+            
+            # Check the URL components to help with troubleshooting
+            try:
+                parsed_url = urlparse(self.main_uri)
+                logger.error(f"Elasticsearch connection details - Host: {parsed_url.hostname}, Port: {parsed_url.port}, "
+                          f"Protocol: {parsed_url.scheme}")
+            except Exception as parse_error:
+                logger.error(f"Error parsing Elasticsearch URI: {str(parse_error)}")
+                
+            logger.error("Please check your Elasticsearch server status, network connectivity, and authentication settings")
             return False
             
     async def _create_indices(self):
         """Create Elasticsearch indices with appropriate mappings."""
+        # Check if client is available
+        if not self.client:
+            logger.warning("Cannot create indices - Elasticsearch client is not available")
+            return
+            
         # Credentials index
         credentials_mapping = {
             "mappings": {
@@ -217,6 +357,11 @@ class ElasticsearchManager:
             index_name: Name of the index
             mapping: Index mapping and settings
         """
+        # Check if client is available
+        if not self.client:
+            logger.warning(f"Cannot create index {index_name} - Elasticsearch client is not available")
+            return
+            
         try:
             # Check if index exists
             if not await self.client.indices.exists(index=index_name):
@@ -238,6 +383,10 @@ class ElasticsearchManager:
         Returns:
             ID of the indexed document
         """
+        if not self.client:
+            logger.warning("Cannot index credential - Elasticsearch client is not available")
+            return "elasticsearch_not_available"
+            
         try:
             # Ensure timestamp field
             if "timestamp" not in credential_data:
@@ -252,7 +401,7 @@ class ElasticsearchManager:
             return result["_id"]
         except Exception as e:
             logger.error(f"Failed to index credential: {str(e)}")
-            raise
+            return f"error_{str(e)}"
             
     async def index_cookie(self, cookie_data: Dict[str, Any]) -> str:
         """
@@ -264,6 +413,10 @@ class ElasticsearchManager:
         Returns:
             ID of the indexed document
         """
+        if not self.client:
+            logger.warning("Cannot index cookie - Elasticsearch client is not available")
+            return "elasticsearch_not_available"
+            
         try:
             # Ensure timestamp field
             if "timestamp" not in cookie_data:
@@ -278,7 +431,7 @@ class ElasticsearchManager:
             return result["_id"]
         except Exception as e:
             logger.error(f"Failed to index cookie: {str(e)}")
-            raise
+            return f"error_{str(e)}"
             
     async def index_system_info(self, system_data: Dict[str, Any]) -> str:
         """
@@ -290,6 +443,10 @@ class ElasticsearchManager:
         Returns:
             ID of the indexed document
         """
+        if not self.client:
+            logger.warning("Cannot index system info - Elasticsearch client is not available")
+            return "elasticsearch_not_available"
+            
         try:
             # Ensure timestamp field
             if "timestamp" not in system_data:
@@ -304,7 +461,7 @@ class ElasticsearchManager:
             return result["_id"]
         except Exception as e:
             logger.error(f"Failed to index system info: {str(e)}")
-            raise
+            return f"error_{str(e)}"
             
     async def log_activity(self, log_data: Dict[str, Any]) -> str:
         """
@@ -316,6 +473,10 @@ class ElasticsearchManager:
         Returns:
             ID of the indexed document
         """
+        if not self.client:
+            logger.warning("Cannot log activity - Elasticsearch client is not available")
+            return "elasticsearch_not_available"
+            
         try:
             # Ensure timestamp field
             if "timestamp" not in log_data:
@@ -330,7 +491,7 @@ class ElasticsearchManager:
             return result["_id"]
         except Exception as e:
             logger.error(f"Failed to log activity: {str(e)}")
-            raise
+            return f"error_{str(e)}"
             
     async def create_correlation(self, correlation_data: Dict[str, Any]) -> str:
         """
@@ -342,6 +503,10 @@ class ElasticsearchManager:
         Returns:
             ID of the indexed document
         """
+        if not self.client:
+            logger.warning("Cannot create correlation - Elasticsearch client is not available")
+            return "elasticsearch_not_available"
+            
         try:
             # Ensure timestamp field
             if "timestamp" not in correlation_data:
@@ -356,7 +521,7 @@ class ElasticsearchManager:
             return result["_id"]
         except Exception as e:
             logger.error(f"Failed to create correlation: {str(e)}")
-            raise
+            return f"error_{str(e)}"
             
     async def search_credentials(self, query: Dict[str, Any], size: int = 100) -> List[Dict[str, Any]]:
         """
@@ -369,6 +534,10 @@ class ElasticsearchManager:
         Returns:
             List of matching credentials
         """
+        if not self.client:
+            logger.warning("Cannot search credentials - Elasticsearch client is not available")
+            return []
+            
         try:
             result = await self.client.search(
                 index=self.credentials_index,
@@ -392,6 +561,10 @@ class ElasticsearchManager:
         Returns:
             List of correlation results
         """
+        if not self.client:
+            logger.warning("Cannot correlate data - Elasticsearch client is not available")
+            return []
+            
         try:
             start_time = datetime.utcnow() - timedelta(hours=hours)
             
@@ -480,7 +653,7 @@ class ElasticsearchManager:
                     correlations.append(correlation)
                     
             # Save correlations
-            if correlations:
+            if correlations and self.client:
                 # Bulk index correlations
                 bulk_operations = []
                 for correlation in correlations:
@@ -489,7 +662,10 @@ class ElasticsearchManager:
                         "_source": correlation
                     })
                     
-                await async_bulk(self.client, bulk_operations)
+                try:
+                    await async_bulk(self.client, bulk_operations)
+                except Exception as bulk_error:
+                    logger.error(f"Failed to bulk index correlations: {bulk_error}")
                 
             return correlations
         except Exception as e:
@@ -506,6 +682,10 @@ class ElasticsearchManager:
         Returns:
             ID of the indexed document
         """
+        if not self.client:
+            logger.warning("Cannot index parser stats - Elasticsearch client is not available")
+            return "elasticsearch_not_available"
+            
         try:
             # Create document with flattened structure for better querying
             stats_doc = {
@@ -531,7 +711,7 @@ class ElasticsearchManager:
             return result["_id"]
         except Exception as e:
             logger.error(f"Failed to index parser stats: {str(e)}")
-            raise
+            return f"error_{str(e)}"
             
     async def get_parser_stats_trends(self, days: int = 7) -> Dict[str, Any]:
         """
@@ -543,6 +723,10 @@ class ElasticsearchManager:
         Returns:
             Dictionary with trend data
         """
+        if not self.client:
+            logger.warning("Cannot get parser stats trends - Elasticsearch client is not available")
+            return {"daily_trends": [], "top_plugins": []}
+            
         try:
             start_time = datetime.utcnow() - timedelta(days=days)
             
@@ -595,4 +779,7 @@ class ElasticsearchManager:
             
     async def close(self):
         """Close Elasticsearch connection."""
-        await self.client.close()
+        if self.client:
+            await self.client.close()
+        else:
+            logger.debug("No Elasticsearch client to close")

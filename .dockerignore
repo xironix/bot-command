@@ -1,0 +1,46 @@
+# Python files
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.nox/
+.hypothesis/
+.ruff_cache/
+
+# Environment
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# IDE files
+.idea/
+.vscode/
+.DS_Store
+*.swp
+*.swo
+
+# Project files
+logs/
+debug_logs/
+downloads/
+temp_extracted/
+*.session
+*.session-journal
+
+# Git
+.git/
+.gitignore
+
+# Docs
+README.md
+IMPROVEMENTS.md
+*.md

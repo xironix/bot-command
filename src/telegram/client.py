@@ -11,11 +11,11 @@ import os
 import shutil
 import binascii # Needed for base64 errors during download
 from datetime import datetime, timedelta
-from typing import Dict, Callable, Any, Optional, Union, Coroutine
+from typing import Dict, List, Callable, Any, Optional, Union, Coroutine
 
-from telethon import TelegramClient, events, errors
-from telethon.tl import types
+from telethon import TelegramClient, events, errors, types, utils
 from telethon.sessions import StringSession # Can use StringSession if needed, file default is fine
+from pymongo.errors import PyMongoError # Import PyMongoError if needed
 
 from config.settings import config
 from src.storage.mongo_client import MongoDBManager
@@ -25,7 +25,7 @@ logger = logging.getLogger(__name__)
 class TelegramMonitor:
     """Monitors Telegram bots by polling updates for each bot token."""
     
-    def __init__(self, message_handler: Callable[[Dict[str, Any]], Coroutine]):
+    def __init__(self, message_handler: Callable[..., Coroutine[Any, Any, None]]):
         """
         Initialize Telegram monitor.
         
@@ -42,75 +42,99 @@ class TelegramMonitor:
         # Media file management
         self.downloads_dir = os.path.abspath("downloads")
         self.tracked_downloads = set()  # Set of downloaded files being tracked
-        self.media_retention_days = int(os.getenv("MEDIA_RETENTION_DAYS", "30"))
-        self.max_disk_usage_gb = float(os.getenv("MAX_DISK_USAGE_GB", "10"))
         
-        # Create downloads directory if it doesn't exist
+        # Session file management
+        self.sessions_dir = os.path.abspath("sessions")
+        
+        # Create directories if they don't exist
         os.makedirs(self.downloads_dir, exist_ok=True)
+        os.makedirs(self.sessions_dir, exist_ok=True)
         
     async def initialize(self):
         """Initialize Telegram clients and connections for active bots."""
         logger.info("Initializing Telegram Monitor...")
-        self._shutdown_event.clear() # Ensure shutdown event is not set
+        self._shutdown_event.clear()
         
+        active_bots: List[Dict[str, str]] = [] # Type hint for clarity
         try:
-            # Get active bot tokens from MongoDB
-            active_tokens = await self.mongo.get_active_bot_tokens()
-            if not active_tokens:
+            # Get active bots (list of dicts with 'username' and 'token')
+            active_bots = await self.mongo.get_active_bots()
+            if not active_bots:
                 logger.warning("No active bot tokens found in database. Monitor will not start any clients.")
                 return
             
-            logger.info(f"Found {len(active_tokens)} active bot tokens. Initializing clients...")
+            logger.info(f"Found {len(active_bots)} active bots. Initializing clients...")
             
             init_tasks = []
-            for token in active_tokens:
-                # Create a task for each bot initialization
-                init_tasks.append(asyncio.create_task(self._initialize_bot_client(token)))
+            tokens_for_tasks = [] # Keep track of tokens corresponding to tasks
+            for bot_data in active_bots:
+                token = bot_data.get("token")
+                if isinstance(token, str) and ':' in token: # Validate token is a string
+                    # Create a task for each bot initialization
+                    init_tasks.append(asyncio.create_task(self._initialize_bot_client(token)))
+                    tokens_for_tasks.append(token) # Store the token for this task
+                else:
+                    logger.warning(f"Skipping bot data with invalid/missing token: {bot_data}")
             
+            if not init_tasks:
+                logger.warning("No valid bot tokens found to initialize.")
+                return
+
             # Wait for all initialization tasks to complete
             results = await asyncio.gather(*init_tasks, return_exceptions=True)
             
             successful_inits = 0
             for i, result in enumerate(results):
-                token = active_tokens[i]
+                # Use the token saved in tokens_for_tasks which maps 1:1 to results
+                token = tokens_for_tasks[i] 
+                
                 if isinstance(result, Exception):
-                    logger.error(f"Failed to initialize client for token {token[:10]}...: {result}")
+                    # Log error using the correct token string
+                    logger.error(f"Failed to initialize client for token {token[:10]}...: {result}", exc_info=isinstance(result, PyMongoError)) # Show traceback for db errors too
                 elif result: # _initialize_bot_client returns True on success
                     successful_inits += 1
                 # else: _initialize_bot_client returned False (e.g., connection failed)
             
-            if successful_inits == 0 and active_tokens:
+            if successful_inits == 0 and active_bots:
                  logger.error("Failed to initialize any bot clients. Telegram monitoring will not function.")
-                 # Decide if we should raise an error here or just log
-                 # raise RuntimeError("Failed to initialize any Telegram bot clients.")
             else:
-                 logger.info(f"Successfully initialized {successful_inits}/{len(active_tokens)} bot clients.")
+                 logger.info(f"Successfully initialized {successful_inits}/{len(init_tasks)} bot clients.")
             
             # Schedule cleanup tasks (only if any clients initialized)
             if successful_inits > 0:
                 asyncio.create_task(self._schedule_media_cleanup())
-                # Clean up any leftover files from previous runs
                 await self._cleanup_old_downloads()
             
             logger.info("Telegram monitor initialization complete.")
             
+        except PyMongoError as e: # Specific handling for DB errors during init
+             logger.error(f"Database error during Telegram client initialization: {e}", exc_info=True)
+             await self.close() 
+             raise
         except Exception as e:
-            logger.error(f"Critical error during Telegram client initialization process: {str(e)}", exc_info=True)
-            await self.close() # Attempt graceful shutdown on critical init failure
-            raise # Re-raise the exception
+            logger.error(f"Critical error during Telegram client initialization process: {e}", exc_info=True)
+            await self.close()
+            raise
         
     async def _initialize_bot_client(self, token: str) -> bool:
         """Initializes and starts polling for a single bot token."""
-        session_name = f"bot_{token[:10]}"
-        logger.debug(f"Initializing client for token {token[:10]}... (Session: {session_name})")
-        client: Optional[TelegramClient] = None # Explicitly type hint
+        # --- Add check for API ID/Hash early --- 
+        if not self.config.api_id or not self.config.api_hash:
+            logger.error("Telegram API ID or API Hash is missing in the configuration. Cannot initialize client.")
+            # Consider raising an error or returning False immediately if this is critical
+            # raise ValueError("Missing Telegram API ID or Hash")
+            return False # Stop initialization for this bot if config is missing
+        # --- End Check ---
+
+        # Define session path within the sessions directory
+        session_name_base = f"bot_{token[:10]}" # Base name for logging/debugging
+        session_path = os.path.join(self.sessions_dir, session_name_base)
+        logger.debug(f"Initializing client for token {token[:10]}... (Session path: {session_path}.session)")
+        
+        client: Optional[TelegramClient] = None
         try:
-            client = TelegramClient(
-                session_name,
-                self.config.api_id,
-                self.config.api_hash,
-            )
-            
+            # Pass the full session path to the client constructor
+            client = TelegramClient(session_path, self.config.api_id, self.config.api_hash)
             await client.connect()
             
             if not await client.is_user_authorized():
@@ -120,16 +144,18 @@ class TelegramMonitor:
                       logger.info(f"Successfully signed in with bot token {token[:10]}.")
                  except errors.AuthKeyError:
                       logger.error(f"Authentication failed for token {token[:10]}...: Invalid token or token revoked.")
-                      await client.disconnect()
+                      if client: # Check if client exists before disconnect
+                         await client.disconnect() 
                       return False
                  except errors.ApiIdInvalidError:
                       logger.error(f"Authentication failed for token {token[:10]}...: Invalid api_id/api_hash.")
-                      await client.disconnect()
-                      # This is a fatal config error, maybe raise?
+                      if client: # Check if client exists before disconnect
+                         await client.disconnect() 
                       return False
                  except Exception as auth_err:
                       logger.error(f"Unexpected error signing in with token {token[:10]}...: {auth_err}", exc_info=True)
-                      await client.disconnect()
+                      if client: # Check if client exists before disconnect
+                         await client.disconnect() 
                       return False
             else:
                  logger.info(f"Client for token {token[:10]}... is already authorized.")
@@ -151,24 +177,35 @@ class TelegramMonitor:
                       logger.warning(f"Client for token {token[:10]}... get_me() returned unexpected type: {type(me)}")
 
             self.bot_clients[token] = client
-            task = asyncio.create_task(self._poll_updates(token, client))
-            self.polling_tasks[token] = task
-            logger.info(f"Started polling updates for bot token {token[:10]}...")
+
+            # --- Only start polling if webhooks are NOT configured --- 
+            # First check if webhook_base_url exists and has a value
+            webhook_configured = hasattr(self.config, 'webhook_base_url') and self.config.webhook_base_url
+            
+            if not webhook_configured:
+                logger.info(f"Webhooks not configured, starting polling for bot token {token[:10]}...")
+                task = asyncio.create_task(self._poll_updates(token, client))
+                self.polling_tasks[token] = task
+            else:
+                logger.info(f"Webhooks are configured ({self.config.webhook_base_url}), skipping polling for bot token {token[:10]}...")
+            # --- End Polling Check ---
+            
             return True
 
         except errors.FloodWaitError as e:
             logger.error(f"Flood wait error initializing client for token {token[:10]}...: Waiting {e.seconds}s")
             await asyncio.sleep(e.seconds + 5)
-            # Check client is not None before accessing methods
-            if client and client.is_connected(): await client.disconnect()
+            if client and client.is_connected(): # Check client and connection state
+                await client.disconnect()
             return False
         except ConnectionError as e:
             logger.error(f"Connection error initializing client for token {token[:10]}...: {e}")
-            if client and client.is_connected(): await client.disconnect()
+            if client and client.is_connected(): # Check client and connection state
+                await client.disconnect()
             return False
         except Exception as e:
-            logger.error(f"Unexpected error initializing client for token {token[:10]}...: {str(e)}", exc_info=True)
-            if client and client.is_connected():
+            logger.error(f"Unexpected error initializing client for token {token[:10]}...: {e}", exc_info=True)
+            if client and client.is_connected(): # Check client and connection state
                 await client.disconnect()
             return False
         
@@ -253,8 +290,13 @@ class TelegramMonitor:
             await client.disconnect()
         
     async def _process_incoming_message(self, token: str, client: TelegramClient, message: types.Message, bot_info: Dict):
-        """Process a message received by a specific bot."""
+        """Process a single incoming message."""
         try:
+            # Basic message info for logging - Use utils.get_peer_id
+            chat_id = utils.get_peer_id(message.peer_id) 
+            msg_info = f"Message ID {message.id} from chat {chat_id}"
+            logger.debug(f"Processing {msg_info} for bot {bot_info.get('username', 'UNKNOWN')}")
+
             sender_info = {}
             sender_entity = None
             # Use getattr for safer access to from_id (often more reliable than sender_id)
@@ -359,10 +401,11 @@ class TelegramMonitor:
             # Generate a unique filename based on bot_id and message_id
             # Await get_me() before accessing its attributes
             me = await client.get_me()
-            if not me or not hasattr(me, 'id'): # Ensure me and me.id exist
-                 logger.error(f"Could not determine client bot ID for download. Client: {client}")
+            # Ensure me is a User object before accessing id
+            if not isinstance(me, types.User):
+                 logger.error(f"Could not determine client bot ID (not a User type: {type(me)}) for download.")
                  return None
-            bot_id = me.id
+            bot_id = me.id # Now safe to access id
 
             timestamp = datetime.utcnow().strftime('%Y%m%d%H%M%S%f')
             filename_base = f"bot{bot_id}_msg{message.id}_{timestamp}"
@@ -400,8 +443,8 @@ class TelegramMonitor:
         try:
             total, used, free = shutil.disk_usage(self.downloads_dir)
             used_gb = used / (1024**3)
-            if used_gb > self.max_disk_usage_gb:
-                logger.warning(f"Disk usage ({used_gb:.2f} GB) exceeds limit ({self.max_disk_usage_gb} GB)")
+            if used_gb > self.config.max_disk_usage_gb:
+                logger.warning(f"Disk usage ({used_gb:.2f} GB) exceeds limit ({self.config.max_disk_usage_gb} GB)")
                 return False
             return True
         except Exception as e:
@@ -410,9 +453,9 @@ class TelegramMonitor:
         
     async def _cleanup_old_downloads(self, force: bool = False):
         """Remove old downloaded media files."""
-        logger.info(f"Running media cleanup. Retention: {self.media_retention_days} days. Force: {force}")
+        logger.info(f"Running media cleanup. Retention: {self.config.media_retention_days} days. Force: {force}")
         now = datetime.utcnow()
-        cutoff = now - timedelta(days=self.media_retention_days)
+        cutoff = now - timedelta(days=self.config.media_retention_days)
         cleaned_count = 0
         cleaned_size = 0
 
@@ -523,8 +566,22 @@ class TelegramMonitor:
         logger.info(f"Disconnecting {len(clients_to_disconnect)} Telegram clients...")
         disconnect_tasks = []
         for client in clients_to_disconnect:
-            if client.is_connected():
-                disconnect_tasks.append(asyncio.create_task(client.disconnect()))
+            # Ensure client exists and is connected before creating disconnect task
+            if client and client.is_connected(): 
+                try:
+                    # In some Telethon versions, disconnect() returns a Future not a coroutine
+                    disconnect_result = client.disconnect()
+                    # If it's already a Future, add it directly to the list
+                    if hasattr(disconnect_result, 'add_done_callback'):
+                        disconnect_tasks.append(disconnect_result)
+                    else:
+                        # Otherwise, it's a coroutine that needs to be wrapped in a Task
+                        disconnect_tasks.append(asyncio.create_task(disconnect_result))
+                except Exception as e:
+                    logger.warning(f"Error disconnecting client: {e}")
+            elif client:
+                logger.debug(f"Client {client.session.filename} already disconnected or never connected.")
+            # else: client object itself was None (shouldn't happen if added to dict)
 
         if disconnect_tasks:
             await asyncio.gather(*disconnect_tasks, return_exceptions=True)
