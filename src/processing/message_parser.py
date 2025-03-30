@@ -27,29 +27,27 @@ class MessageParser:
         # Initialize parser plugins
         self._initialize_plugins()
         
-        # Create lock for thread-safe updates to stats
-        self.stats_lock = asyncio.Lock()
-        
-        # Track parsing statistics
-        self.stats = {
+        # Initialize stats tracker
+        from src.utils.stats_tracker import StatsTracker
+        self.stats_tracker = StatsTracker({
             "total_processed": 0,
             "successful_credential_extractions": 0,
             "successful_cookie_extractions": 0,
             "successful_system_info_extractions": 0,
             "successful_crypto_wallet_extractions": 0,
-            "successful_credit_card_extractions": 0,  # Added for credit card tracking
-            "high_value_extractions": 0,  # Count of high-value logs (>70 score)
-            "very_high_value_extractions": 0, # Count of extremely valuable logs (>90 score)
-            "plugin_successes": 0,        # Count of successful plugin parses
-            "plugin_failures": 0,         # Count of plugin failures
+            "successful_credit_card_extractions": 0,
+            "high_value_extractions": 0,
+            "very_high_value_extractions": 0,
+            "plugin_successes": 0,
+            "plugin_failures": 0,
             "failed_parsings": 0,
-            "pattern_failures": {},       # Track which patterns are failing most often
-            "plugins": {}                 # Plugin-specific stats
-        }
+            "pattern_failures": {},
+            "plugins": {}
+        })
         
         # Initialize plugin stats
         for plugin in self.plugins:
-            self.stats["plugins"][plugin.name] = {
+            self.stats_tracker.stats["plugins"][plugin.name] = {
                 "attempts": 0,
                 "successes": 0,
                 "failures": 0,
@@ -663,9 +661,7 @@ class MessageParser:
             stat_key: Key of the stat to increment
             increment: Value to increment by (default: 1)
         """
-        async with self.stats_lock:
-            if stat_key in self.stats:
-                self.stats[stat_key] += increment
+        await self.stats_tracker.increment(stat_key, increment)
     
     async def _update_plugin_stat(self, plugin_name, stat_key, increment=1):
         """
@@ -676,9 +672,7 @@ class MessageParser:
             stat_key: Key of the stat to update
             increment: Value to increment by (default: 1)
         """
-        async with self.stats_lock:
-            if plugin_name in self.stats["plugins"] and stat_key in self.stats["plugins"][plugin_name]:
-                self.stats["plugins"][plugin_name][stat_key] += increment
+        await self.stats_tracker.update_nested("plugins", plugin_name, stat_key, increment)
     
     async def _update_plugin_avg(self, plugin_name, avg_key, new_value):
         """
@@ -689,21 +683,14 @@ class MessageParser:
             avg_key: Key of the average stat to update
             new_value: New value to include in the average
         """
-        async with self.stats_lock:
-            if plugin_name in self.stats["plugins"] and avg_key in self.stats["plugins"][plugin_name]:
-                plugin_stats = self.stats["plugins"][plugin_name]
-                if avg_key == "avg_confidence":
-                    attempts = plugin_stats["attempts"]
-                    if attempts > 0:
-                        plugin_stats[avg_key] = (
-                            (plugin_stats[avg_key] * (attempts - 1) + new_value) / attempts
-                        )
-                elif avg_key == "avg_value_score":
-                    successes = plugin_stats["successes"]
-                    if successes > 0:
-                        plugin_stats[avg_key] = (
-                            (plugin_stats[avg_key] * (successes - 1) + new_value) / successes
-                        )
+        if avg_key == "avg_confidence":
+            count_key = "attempts"
+        elif avg_key == "avg_value_score":
+            count_key = "successes"
+        else:
+            return
+            
+        await self.stats_tracker.update_average("plugins", plugin_name, avg_key, count_key, new_value)
     
     async def _update_pattern_failure(self, failure_key):
         """
@@ -712,10 +699,12 @@ class MessageParser:
         Args:
             failure_key: Key of the pattern that failed
         """
-        async with self.stats_lock:
-            if failure_key not in self.stats["pattern_failures"]:
-                self.stats["pattern_failures"][failure_key] = 0
-            self.stats["pattern_failures"][failure_key] += 1
+        if "pattern_failures" not in self.stats_tracker.stats:
+            async with self.stats_tracker.lock:
+                if "pattern_failures" not in self.stats_tracker.stats:
+                    self.stats_tracker.stats["pattern_failures"] = {}
+        
+        await self.stats_tracker.update_nested("pattern_failures", failure_key, "count", 1)
     
     async def get_parser_stats(self) -> Dict[str, Any]:
         """
@@ -724,29 +713,32 @@ class MessageParser:
         Returns:
             Dictionary with parser statistics including plugin performance
         """
-        async with self.stats_lock:
-            stats = dict(self.stats)  # Make a copy
+        # Get a copy of all stats
+        stats = await self.stats_tracker.get_all()
+        
+        # Add success rate calculations
+        if stats.get("total_processed", 0) > 0:
+            total_processed = stats["total_processed"]
+            failed_parsings = stats.get("failed_parsings", 0)
+            plugin_successes = stats.get("plugin_successes", 0)
             
-            # Add success rate calculations
-            if stats["total_processed"] > 0:
-                stats["overall_success_rate"] = (
-                    (stats["total_processed"] - stats["failed_parsings"]) / 
-                    stats["total_processed"] * 100
-                )
-                
-                # Calculate plugin success rates
-                for plugin_name, plugin_stats in stats["plugins"].items():
-                    if plugin_stats["attempts"] > 0:
-                        plugin_stats["success_rate"] = (
-                            plugin_stats["successes"] / plugin_stats["attempts"] * 100
-                        )
-                        
-                # Calculate overall plugin usage rate
-                stats["plugin_usage_rate"] = (
-                    stats["plugin_successes"] / stats["total_processed"] * 100
-                )
-                
-            return stats
+            stats["overall_success_rate"] = (
+                (total_processed - failed_parsings) / total_processed * 100
+            )
+            
+            # Calculate plugin success rates
+            for plugin_name, plugin_stats in stats.get("plugins", {}).items():
+                if plugin_stats.get("attempts", 0) > 0:
+                    plugin_stats["success_rate"] = (
+                        plugin_stats.get("successes", 0) / plugin_stats["attempts"] * 100
+                    )
+                    
+            # Calculate overall plugin usage rate
+            stats["plugin_usage_rate"] = (
+                plugin_successes / total_processed * 100
+            )
+            
+        return stats
     
     def _is_parsable_file(self, file_path: str) -> bool:
         """
@@ -758,63 +750,16 @@ class MessageParser:
         Returns:
             True if the file can be parsed, False otherwise
         """
-        if not os.path.exists(file_path):
-            return False
+        # Initialize file handler if not already done
+        if not hasattr(self, 'file_handler'):
+            from src.utils.file_handler import FileHandler
+            self.file_handler = FileHandler()
             
-        # Check file extension
-        _, ext = os.path.splitext(file_path)
-        ext = ext.lower()
+        # Use file handler to detect file type
+        file_type = self.file_handler.detect_file_type(file_path)
         
-        # List of parsable extensions
-        parsable_extensions = ['.txt', '.json', '.csv', '.xml', '.log']
-        # Add archive extensions that can be extracted
-        archive_extensions = ['.zip', '.rar', '.7z', '.tar', '.gz']
-        
-        # Check file size is not too large (limit to 10MB for safety)
-        try:
-            file_size = os.path.getsize(file_path)
-            if file_size > 10 * 1024 * 1024:  # 10MB
-                logger.warning(f"File too large to parse: {file_path} ({file_size / (1024*1024):.2f} MB)")
-                return False
-        except Exception as e:
-            logger.error(f"Error checking file size for {file_path}: {str(e)}")
-            return False
-        
-        # Check if it's a directly parsable file or archive
-        if ext in parsable_extensions or ext in archive_extensions:
-            return True
-            
-        # Try to detect file type by content (first 4KB)
-        try:
-            with open(file_path, "rb") as f:
-                header = f.read(4096)
-                
-            # Check for text file markers
-            text_markers = [b'\n', b'\r', b' ', b'\t', b'{', b'[']
-            if any(marker in header for marker in text_markers) and b'\x00' not in header:
-                # Likely a text file
-                return True
-                
-            # Check for ZIP file signature
-            if header.startswith(b'PK\x03\x04'):
-                return True
-                
-            # Check for JSON structure
-            try:
-                text_start = header.decode('utf-8', errors='ignore').strip()
-                if text_start.startswith('{') or text_start.startswith('['):
-                    return True
-            except UnicodeDecodeError:
-                # This specific exception is expected if the header isn't valid UTF-8
-                pass
-            except Exception as e:
-                # Catch other potential errors during strip/startswith
-                logger.warning(f"Unexpected error checking file header in _is_parsable_file for {file_path}: {e}")
-                pass # Continue check if possible, but log it
-        except Exception as e:
-            logger.error(f"Error examining file content for {file_path}: {str(e)}")
-            
-        return False
+        # Return True for parsable file types
+        return file_type in ['txt', 'json', 'csv', 'xml', 'zip', 'tar']
         
     def _parse_file(self, file_path: str) -> Dict[str, Any]:
         """
@@ -826,6 +771,11 @@ class MessageParser:
         Returns:
             Dictionary with extracted structured data
         """
+        # Initialize file handler if not already done
+        if not hasattr(self, 'file_handler'):
+            from src.utils.file_handler import FileHandler
+            self.file_handler = FileHandler()
+            
         # Try plugin-based parsing first (for known file formats)
         for plugin in self.plugins:
             try:
@@ -838,125 +788,19 @@ class MessageParser:
             except Exception as e:
                 logger.error(f"Plugin {plugin.name} failed to parse file: {str(e)}")
                 
-        # Check if file is an archive and extract contents
-        _, ext = os.path.splitext(file_path)
-        ext = ext.lower()
-        if ext in ['.zip', '.tar', '.gz', '.tgz']:
-            extracted_results = self._process_archive(file_path)
-            if extracted_results:
-                return extracted_results
-        
-        # Fallback to generic parsing
-        result = {}
-        
-        # Check file extension
-        
-        try:
-            # Parse based on file type
-            if ext == '.json':
-                with open(file_path, 'r', encoding='utf-8') as f:
-                    data = json.load(f)
-                    
-                # Check for known data structures
-                if isinstance(data, dict):
-                    # Check for credentials
-                    if 'username' in data and 'password' in data:
-                        result.setdefault("credentials", []).append({
-                            "username": data["username"],
-                            "password": data["password"],
-                            "domain": data.get("domain", self._extract_domain_from_username(data["username"]))
-                        })
-                        
-                    # Check for cookies
-                    if 'cookies' in data:
-                        cookies = data['cookies']
-                        if isinstance(cookies, list):
-                            result.setdefault("cookies", []).extend([
-                                {"domain": c.get("domain", ""), "value": c.get("value", "")}
-                                for c in cookies if isinstance(c, dict)
-                            ])
-                        elif isinstance(cookies, dict):
-                            result.setdefault("cookies", []).append({
-                                "domain": data.get("domain", ""),
-                                "value": str(cookies)
-                            })
-                            
-                    # Check for system info
-                    if 'system' in data or 'os' in data or 'hardware' in data:
-                        system_info = {}
-                        if 'system' in data:
-                            system_info["full_info"] = str(data["system"])
-                        if 'os' in data:
-                            system_info["os"] = str(data["os"])
-                        if 'hardware' in data:
-                            system_info["hardware"] = str(data["hardware"])
-                        if 'ip' in data:
-                            system_info["ip"] = str(data["ip"])
-                            
-                        result["system_info"] = system_info
-                        
-            elif ext == '.txt':
-                with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
-                    text = f.read()
-                    
-                # Parse text similar to message text
-                credentials = self._extract_credentials(text)
-                if credentials:
-                    result.setdefault("credentials", []).extend(credentials)
-                    
-                cookies = self._extract_cookies(text)
-                if cookies:
-                    result.setdefault("cookies", []).extend(cookies)
-                    
-                system_info = self._extract_system_info(text)
-                if system_info:
-                    result["system_info"] = system_info
-                    
-            elif ext == '.csv':
-                # Process CSV (simplified)
-                import csv
-                credentials = []
-                
-                with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
-                    reader = csv.reader(f)
-                    headers = next(reader, None)
-                    
-                    if headers:
-                        # Check for credential-like patterns in headers
-                        username_idx = None
-                        password_idx = None
-                        
-                        for i, header in enumerate(headers):
-                            header_lower = header.lower()
-                            if any(term in header_lower for term in ['email', 'username', 'user', 'login']):
-                                username_idx = i
-                            elif any(term in header_lower for term in ['password', 'pwd', 'pass']):
-                                password_idx = i
-                            elif any(term in header_lower for term in ['domain', 'site', 'service']):
-                                pass # Do nothing if we only find a domain header
-                                
-                        # Process rows if we found credential columns
-                        if username_idx is not None and password_idx is not None:
-                            for row in reader:
-                                if len(row) > max(username_idx, password_idx):
-                                    username = row[username_idx].strip()
-                                    password = row[password_idx].strip()
-                                    
-                                    if username and password:
-                                        credential = {
-                                            "username": username,
-                                            "password": password
-                                        }
-                                        
-                                        credentials.append(credential)
-                                        
-                        if credentials:
-                            result.setdefault("credentials", []).extend(credentials)
-                                
-        except Exception as e:
-            logger.error(f"Failed to parse file {file_path}: {str(e)}")
+        # Define a parser function that uses our extraction methods
+        def parse_text(text: str) -> Dict[str, Any]:
+            result = {
+                "credentials": self._extract_credentials(text),
+                "cookies": self._extract_cookies(text),
+                "system_info": self._extract_system_info(text),
+                "file_paths": [],
+                "parsing_errors": []
+            }
+            return result
             
-        return result
+        # Use file handler to process the file
+        return self.file_handler.process_file(file_path, parse_text)
         
     def _validate_plugin_result(self, plugin_name: str, plugin_result: Dict[str, Any]) -> bool:
         """
@@ -1044,109 +888,4 @@ class MessageParser:
             return False
             
         return True
-    def _process_archive(self, archive_path: str) -> Dict[str, Any]:
-        """
-        Extract and process files from an archive.
-        
-        Args:
-            archive_path: Path to the archive file
-            
-        Returns:
-            Dictionary with extracted structured data from all contained files
-        """
-        import tempfile
-        import zipfile
-        import tarfile
-        import shutil
-        
-        # Create a temporary directory for extraction
-        temp_dir = tempfile.mkdtemp(prefix="botcommand_extract_")
-        logger.info(f"Extracting archive {archive_path} to {temp_dir}")
-        
-        extracted_files = []
-        try:
-            # Extract based on file type
-            _, ext = os.path.splitext(archive_path)
-            ext = ext.lower()
-            
-            # Handle ZIP files
-            if ext == '.zip':
-                with zipfile.ZipFile(archive_path, 'r') as zip_ref:
-                    # Check for potential zip bombs
-                    total_size = sum(info.file_size for info in zip_ref.infolist())
-                    if total_size > 100 * 1024 * 1024:  # 100MB limit
-                        logger.warning(f"Zip file too large to extract: {archive_path} ({total_size / (1024*1024):.2f} MB)")
-                        return {}
-                        
-                    # Extract all files
-                    zip_ref.extractall(temp_dir)
-                    extracted_files = [os.path.join(temp_dir, f) for f in zip_ref.namelist() 
-                                      if not f.endswith('/') and os.path.exists(os.path.join(temp_dir, f))]
-            
-            # Handle TAR files (including .tar.gz)
-            elif ext in ['.tar', '.gz', '.tgz']:
-                with tarfile.open(archive_path, 'r:*') as tar_ref:
-                    # Check for potential tar bombs
-                    total_size = sum(m.size for m in tar_ref.getmembers() if m.isfile())
-                    if total_size > 100 * 1024 * 1024:  # 100MB limit
-                        logger.warning(f"Tar file too large to extract: {archive_path} ({total_size / (1024*1024):.2f} MB)")
-                        return {}
-                        
-                    # Filter out dangerous paths (absolute, parent directory traversal)
-                    safe_members = [m for m in tar_ref.getmembers() 
-                                   if not m.name.startswith('/') and '..' not in m.name]
-                    
-                    # Extract safe members
-                    for member in safe_members:
-                        tar_ref.extract(member, temp_dir)
-                        
-                    extracted_files = [os.path.join(temp_dir, m.name) for m in safe_members 
-                                      if m.isfile() and os.path.exists(os.path.join(temp_dir, m.name))]
-            
-            # Process each extracted file
-            result = {
-                "credentials": [],
-                "cookies": [],
-                "system_info": {},
-                "crypto_wallets": [],
-                "file_paths": [],
-                "credit_cards": [],
-                "ftp_credentials": [],
-                "messenger_tokens": [],
-                "sso_tokens": [],
-                "two_factor_codes": [],
-                "parsing_errors": []
-            }
-            
-            for file_path in extracted_files:
-                if self._is_parsable_file(file_path):
-                    try:
-                        file_result = self._parse_file(file_path)
-                        
-                        # Merge results
-                        for key in ["credentials", "cookies", "crypto_wallets", "file_paths", 
-                                   "credit_cards", "ftp_credentials", "messenger_tokens", 
-                                   "sso_tokens", "two_factor_codes", "parsing_errors"]:
-                            if key in file_result and file_result[key]:
-                                result[key].extend(file_result[key])
-                                
-                        # Merge system_info dict
-                        if file_result.get("system_info"):
-                            result["system_info"].update(file_result["system_info"])
-                            
-                    except Exception as e:
-                        error_msg = f"Error processing extracted file {file_path}: {str(e)}"
-                        logger.error(error_msg)
-                        result["parsing_errors"].append(error_msg)
-                        
-            return result
-            
-        except Exception as e:
-            logger.error(f"Error extracting archive {archive_path}: {str(e)}")
-            return {}
-        finally:
-            # Clean up temporary directory
-            try:
-                shutil.rmtree(temp_dir)
-            except Exception as e:
-                logger.error(f"Error cleaning up temporary directory {temp_dir}: {str(e)}")
+    # _process_archive method removed and functionality replaced by FileHandler

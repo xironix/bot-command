@@ -73,47 +73,81 @@ class Coordinator:
             
         logger.info("Initializing Bot-Command coordinator")
         
-        # Initialize worker pool
-        logger.debug("Initializing worker pool...")
-        await self.worker_pool.start()
-        logger.debug("Worker pool initialized.")
-        
-        # Initialize Elasticsearch (if available)
-        logger.debug("Initializing Elasticsearch manager...")
-        elastic_available = await self.elastic_manager.initialize()
-        if not elastic_available:
-            logger.warning("Elasticsearch is not available, some features will be limited")
-        logger.debug("Elasticsearch manager initialized (available: %s).", elastic_available)
+        try:
+            # Initialize worker pool
+            logger.debug("Initializing worker pool...")
+            await self.worker_pool.start()
+            logger.debug("Worker pool initialized.")
             
-        # Initialize Telegram monitor
-        logger.debug("Initializing Telegram monitor...")
-        await self.telegram_monitor.initialize()
-        logger.debug("Telegram monitor initialized.")
-        
-        self.initialized = True
-        logger.info("Bot-Command coordinator initialized")
+            # Initialize MongoDB manager
+            logger.debug("Initializing MongoDB manager...")
+            mongo_available = await self.mongo_manager.initialize()
+            if not mongo_available:
+                logger.error("MongoDB initialization failed, cannot continue")
+                return
+            logger.debug("MongoDB manager initialized successfully.")
+            
+            # Initialize Elasticsearch (if available)
+            logger.debug("Initializing Elasticsearch manager...")
+            elastic_available = await self.elastic_manager.initialize()
+            if not elastic_available:
+                logger.warning("Elasticsearch is not available, some features will be limited")
+            logger.debug("Elasticsearch manager initialized (available: %s).", elastic_available)
+                
+            # Initialize Telegram monitor
+            logger.debug("Initializing Telegram monitor...")
+            telegram_available = await self.telegram_monitor.initialize()
+            if not telegram_available:
+                logger.warning("Telegram monitor initialization failed, monitoring capabilities will be limited")
+            logger.debug("Telegram monitor initialized (available: %s).", telegram_available)
+            
+            self.initialized = True
+            logger.info("Bot-Command coordinator initialized")
+        except Exception as e:
+            logger.error(f"Failed to initialize coordinator: {str(e)}", exc_info=True)
+            # Attempt cleanup
+            await self.shutdown()
         
     async def shutdown(self):
         """Shut down all components."""
-        if not self.initialized:
-            return
-            
         logger.info("Shutting down Bot-Command coordinator")
         
+        shutdown_errors = []
+        
         # Shut down worker pool
-        await self.worker_pool.stop()
+        try:
+            await self.worker_pool.stop()
+        except Exception as e:
+            logger.error(f"Error stopping worker pool: {str(e)}")
+            shutdown_errors.append(f"Worker pool: {str(e)}")
         
         # Close Telegram monitor
-        await self.telegram_monitor.close()
+        try:
+            await self.telegram_monitor.close()
+        except Exception as e:
+            logger.error(f"Error closing Telegram monitor: {str(e)}")
+            shutdown_errors.append(f"Telegram monitor: {str(e)}")
         
         # Close Elasticsearch connection
-        await self.elastic_manager.close()
+        try:
+            await self.elastic_manager.close()
+        except Exception as e:
+            logger.error(f"Error closing Elasticsearch manager: {str(e)}")
+            shutdown_errors.append(f"Elasticsearch: {str(e)}")
         
         # Close MongoDB connection
-        self.mongo_manager.close()
+        try:
+            await self.mongo_manager.close()
+        except Exception as e:
+            logger.error(f"Error closing MongoDB manager: {str(e)}")
+            shutdown_errors.append(f"MongoDB: {str(e)}")
         
         self.initialized = False
-        logger.info("Bot-Command coordinator shut down")
+        
+        if shutdown_errors:
+            logger.warning(f"Bot-Command coordinator shut down with {len(shutdown_errors)} errors")
+        else:
+            logger.info("Bot-Command coordinator shut down cleanly")
         
     async def start_monitoring(self, bot_usernames: Optional[List[str]] = None):
         """

